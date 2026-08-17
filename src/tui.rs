@@ -3,12 +3,11 @@ use crate::net::{parse_ticket, NetEvent, NetSession};
 use crate::room::OpenRoom;
 use crate::store::{DataDir, IndexEntry, Record};
 use anyhow::Result;
-use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
-use futures_lite::StreamExt;
 use iroh::EndpointAddr;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -18,6 +17,7 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Terminal;
 use std::io::{self, Stdout};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{mpsc, Mutex};
 
 enum Screen {
@@ -92,15 +92,45 @@ pub async fn run() -> Result<()> {
     result
 }
 
+fn spawn_input_thread() -> mpsc::UnboundedReceiver<Event> {
+    let (tx, rx) = mpsc::unbounded_channel();
+    std::thread::Builder::new()
+        .name("input".into())
+        .spawn(move || loop {
+            match event::poll(Duration::from_millis(200)) {
+                Ok(true) => match event::read() {
+                    Ok(ev) => {
+                        if tx.send(ev).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                },
+                Ok(false) => {
+                    if tx.is_closed() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        })
+        .expect("input thread");
+    rx
+}
+
+fn is_typing(key: &KeyEvent) -> bool {
+    !matches!(key.kind, KeyEventKind::Release)
+}
+
 async fn run_inner(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
     let mut app = App::new()?;
-    let mut keys = EventStream::new();
+    let mut keys = spawn_input_thread();
     loop {
         terminal.draw(|f| draw(f, &app))?;
         tokio::select! {
-            maybe = keys.next() => {
-                let Some(Ok(Event::Key(key))) = maybe else { continue };
-                if key.kind != KeyEventKind::Press {
+            maybe = keys.recv() => {
+                let Some(Event::Key(key)) = maybe else { continue };
+                if !is_typing(&key) {
                     continue;
                 }
                 if handle_key(&mut app, key).await? {
@@ -355,7 +385,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
             Constraint::Length(1),
             Constraint::Min(3),
             Constraint::Length(1),
-            Constraint::Length(1),
+            Constraint::Length(2),
         ])
         .split(f.area());
 
@@ -505,4 +535,6 @@ fn draw_input(f: &mut ratatui::Frame, area: Rect, app: &App) {
                 .border_style(Style::default().fg(Color::Rgb(50, 55, 50))),
         );
     f.render_widget(p, area);
+    let col = 4u16.saturating_add(shown.chars().count() as u16);
+    f.set_cursor_position((area.x.saturating_add(col), area.y.saturating_add(1)));
 }
