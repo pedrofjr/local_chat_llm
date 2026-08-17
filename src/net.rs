@@ -100,20 +100,23 @@ impl NetSession {
         let ticket = encode_ticket(&endpoint.addr());
         let _ = events.send(NetEvent::Ticket(ticket));
 
+        let me = endpoint.id();
+        let bootstrap: Vec<EndpointAddr> = bootstrap.into_iter().filter(|a| a.id != me).collect();
         let peer_ids: Vec<EndpointId> = bootstrap.iter().map(|a| a.id).collect();
 
-        let topic_handle = if peer_ids.is_empty() {
+        if peer_ids.is_empty() {
             let _ = events.send(NetEvent::Status(
                 "waiting for peers on lan (mdns). /ticket if they can't see you.".into(),
             ));
-            gossip.subscribe(topic, vec![]).await?
         } else {
             let _ = events.send(NetEvent::Status(format!(
-                "dialing {} bootstrap peer(s)…",
+                "looking for {} peer(s)…",
                 peer_ids.len()
             )));
-            gossip.subscribe_and_join(topic, peer_ids.clone()).await?
-        };
+        }
+        // Never subscribe_and_join: it blocks the TUI until a neighbor appears
+        // (and hangs forever if the ticket is this same window).
+        let topic_handle = gossip.subscribe(topic, peer_ids).await?;
         let (sender, receiver) = topic_handle.split();
 
         tokio::spawn(gossip_loop(receiver, room.clone(), events.clone()));
@@ -195,7 +198,8 @@ async fn sync_loop(
             Ok(b) => b,
             Err(_) => continue,
         };
-        for addr in known.clone() {
+        let me = endpoint.id();
+        for addr in known.iter().filter(|a| a.id != me).cloned() {
             if let Ok(conn) = endpoint.connect(addr, SYNC_ALPN).await {
                 if let Ok((mut send, mut recv)) = conn.open_bi().await {
                     if send.write_all(&req).await.is_ok() && send.finish().is_ok() {

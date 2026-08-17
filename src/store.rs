@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
+use std::net::TcpListener;
 use std::path::PathBuf;
 
 pub const MAGIC: &[u8; 6] = b"LLLM1\0";
@@ -20,6 +21,14 @@ pub enum Record {
         body: String,
         sig: Vec<u8>,
     },
+    ChatNamed {
+        author: [u8; 32],
+        seq: u64,
+        ts: u64,
+        name: String,
+        body: String,
+        sig: Vec<u8>,
+    },
 }
 
 impl Record {
@@ -33,7 +42,23 @@ impl Record {
 
     pub fn chat_key(&self) -> Option<([u8; 32], u64)> {
         match self {
-            Record::Chat { author, seq, .. } => Some((*author, *seq)),
+            Record::Chat { author, seq, .. } | Record::ChatNamed { author, seq, .. } => {
+                Some((*author, *seq))
+            }
+            Record::Meta { .. } => None,
+        }
+    }
+
+    pub fn body(&self) -> Option<&str> {
+        match self {
+            Record::Chat { body, .. } | Record::ChatNamed { body, .. } => Some(body),
+            Record::Meta { .. } => None,
+        }
+    }
+
+    pub fn author(&self) -> Option<&[u8; 32]> {
+        match self {
+            Record::Chat { author, .. } | Record::ChatNamed { author, .. } => Some(author),
             Record::Meta { .. } => None,
         }
     }
@@ -52,26 +77,68 @@ pub struct IndexEntry {
 
 pub struct DataDir {
     root: PathBuf,
+    pub instance: u8,
+    _slot: Option<TcpListener>,
+}
+
+fn claim_instance_slot() -> Result<(u8, TcpListener)> {
+    for n in 1u8..=8 {
+        let port = 41770 + u16::from(n);
+        if let Ok(listener) = TcpListener::bind(("127.0.0.1", port)) {
+            let _ = listener.set_nonblocking(true);
+            return Ok((n, listener));
+        }
+    }
+    Err(anyhow!("too many local-llm windows open (max 8)"))
 }
 
 impl DataDir {
     pub fn open() -> Result<Self> {
-        if let Ok(custom) = std::env::var("LOCAL_LLM_HOME") {
-            let root = PathBuf::from(custom);
-            fs::create_dir_all(root.join("rooms")).ok();
-            return Ok(Self { root });
-        }
-        let base = directories::ProjectDirs::from("dev", "local-llm", "local-llm")
-            .map(|d| d.data_local_dir().to_path_buf())
-            .unwrap_or_else(|| PathBuf::from(".local-llm"));
-        fs::create_dir_all(base.join("rooms")).context("create data dir")?;
-        Ok(Self { root: base })
+        let base = if let Ok(custom) = std::env::var("LOCAL_LLM_HOME") {
+            PathBuf::from(custom)
+        } else {
+            directories::ProjectDirs::from("dev", "local-llm", "local-llm")
+                .map(|d| d.data_local_dir().to_path_buf())
+                .unwrap_or_else(|| PathBuf::from(".local-llm"))
+        };
+        let (instance, slot) = claim_instance_slot()?;
+        let root = if instance == 1 {
+            base
+        } else {
+            base.join(format!("guest-{instance}"))
+        };
+        fs::create_dir_all(root.join("rooms")).context("create data dir")?;
+        Ok(Self {
+            root,
+            instance,
+            _slot: Some(slot),
+        })
     }
 
     #[cfg(test)]
     pub fn from_path(root: PathBuf) -> Result<Self> {
         fs::create_dir_all(root.join("rooms"))?;
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            instance: 1,
+            _slot: None,
+        })
+    }
+
+    pub fn nick_path(&self) -> PathBuf {
+        self.root.join("nick")
+    }
+
+    pub fn load_nick(&self) -> String {
+        fs::read_to_string(self.nick_path())
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "user".into())
+    }
+
+    pub fn save_nick(&self, nick: &str) -> Result<()> {
+        fs::write(self.nick_path(), nick.trim()).context("save nick")
     }
 
     pub fn device_key_path(&self) -> PathBuf {
@@ -221,11 +288,11 @@ impl RoomLog {
     pub fn heads(&self) -> BTreeMap<[u8; 32], u64> {
         let mut heads = BTreeMap::new();
         for rec in &self.records {
-            if let Record::Chat { author, seq, .. } = rec {
+            if let Some((author, seq)) = rec.chat_key() {
                 heads
-                    .entry(*author)
-                    .and_modify(|s: &mut u64| *s = (*s).max(*seq))
-                    .or_insert(*seq);
+                    .entry(author)
+                    .and_modify(|s: &mut u64| *s = (*s).max(seq))
+                    .or_insert(seq);
             }
         }
         heads
@@ -234,9 +301,9 @@ impl RoomLog {
     pub fn missing_for(&self, their: &BTreeMap<[u8; 32], u64>) -> Vec<Record> {
         self.records
             .iter()
-            .filter(|rec| match rec {
-                Record::Meta { .. } => true,
-                Record::Chat { author, seq, .. } => their.get(author).is_none_or(|h| *seq > *h),
+            .filter(|rec| match rec.chat_key() {
+                None => matches!(rec, Record::Meta { .. }),
+                Some((author, seq)) => their.get(&author).is_none_or(|h| seq > *h),
             })
             .cloned()
             .collect()
@@ -333,6 +400,15 @@ mod tests {
         assert_eq!(a.merge(vec![rec.clone()]).unwrap(), 1);
         assert_eq!(a.merge(vec![rec]).unwrap(), 0);
         assert_eq!(a.heads().get(&[2u8; 32]).copied(), Some(3));
+    }
+
+    #[test]
+    fn nick_persists() {
+        let tmp = TempDir::new().unwrap();
+        let dir = DataDir::from_path(tmp.path().to_path_buf()).unwrap();
+        assert_eq!(dir.load_nick(), "user");
+        dir.save_nick("Diamante").unwrap();
+        assert_eq!(dir.load_nick(), "Diamante");
     }
 
     #[test]

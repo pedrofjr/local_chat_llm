@@ -51,7 +51,7 @@ impl App {
             sessions,
             selected: 0,
             input: String::new(),
-            status: "/new <name>    /join <pin> [ticket]    /quit".into(),
+            status: "/new <name>    /join <pin> [ticket]    /nick <nome>    /quit".into(),
             room: None,
             net: None,
             events_rx: None,
@@ -204,7 +204,7 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> Result<bool> {
             KeyCode::Esc => {
                 app.screen = Screen::Home;
                 app.input.clear();
-                app.status = "/new <name>    /join <pin> [ticket]    /quit".into();
+                app.status = "/new <name>    /join <pin> [ticket]    /nick <nome>    /quit".into();
             }
             KeyCode::Enter => {
                 let pin_raw = app.input.clone();
@@ -230,7 +230,7 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> Result<bool> {
                 app.shutdown_net().await;
                 app.refresh_sessions();
                 app.screen = Screen::Home;
-                app.status = "/new <name>    /join <pin> [ticket]    /quit".into();
+                app.status = "/new <name>    /join <pin> [ticket]    /nick <nome>    /quit".into();
             }
             KeyCode::PageUp => app.scroll = app.scroll.saturating_add(4),
             KeyCode::PageDown => app.scroll = app.scroll.saturating_sub(4),
@@ -325,6 +325,34 @@ async fn handle_command(app: &mut App, line: String) -> Result<bool> {
         "/peers" => {
             app.status = format!("{} peer(s) in overlay", app.peer_count);
         }
+        "/nick" | "/name" => {
+            let name = parts.collect::<Vec<_>>().join(" ");
+            if name.is_empty() {
+                let current = if let Some(room) = &app.room {
+                    room.lock().await.nick.clone()
+                } else {
+                    app.dir.load_nick()
+                };
+                app.status = format!("nick {current}  — /nick Diamante to change");
+            } else if let Some(room) = &app.room {
+                match room.lock().await.set_nick(&app.dir, name) {
+                    Ok(()) => {
+                        let nick = room.lock().await.nick.clone();
+                        app.status =
+                            format!("nick is now {nick}. old messages keep the previous name.");
+                    }
+                    Err(e) => app.status = format!("/nick: {e}"),
+                }
+            } else {
+                match crate::room::normalize_nick(&name) {
+                    Ok(nick) => match app.dir.save_nick(&nick) {
+                        Ok(()) => app.status = format!("nick is now {nick}"),
+                        Err(e) => app.status = format!("/nick: {e}"),
+                    },
+                    Err(e) => app.status = format!("/nick: {e}"),
+                }
+            }
+        }
         "/forget" => {
             if let Some(room) = &app.room {
                 let topic = crate::crypto::topic_id(&room.lock().await.pin);
@@ -345,7 +373,7 @@ async fn handle_command(app: &mut App, line: String) -> Result<bool> {
         }
         "/help" => {
             app.status =
-                "/new /join /pin /ticket /peers /forget /quit   esc = leave session".into();
+                "/new /join /nick /pin /ticket /peers /forget /quit   esc = leave session".into();
         }
         other if other.starts_with('/') => {
             app.status = format!("unknown command {other}  — /help");
@@ -356,6 +384,7 @@ async fn handle_command(app: &mut App, line: String) -> Result<bool> {
 }
 
 async fn enter_chat(app: &mut App, room: OpenRoom, bootstrap: Vec<EndpointAddr>) {
+    app.shutdown_net().await;
     let secret = room.secret.clone();
     let shared = Arc::new(Mutex::new(room));
     let (tx, rx) = mpsc::unbounded_channel();
@@ -400,16 +429,24 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
 }
 
 fn draw_header(f: &mut ratatui::Frame, area: Rect, app: &App) {
+    let inst = if app.dir.instance > 1 {
+        format!("  #{}", app.dir.instance)
+    } else {
+        String::new()
+    };
     let title = match &app.screen {
-        Screen::Home => format!("  local-llm  {}", env!("CARGO_PKG_VERSION")),
-        Screen::Unlock { alias, .. } => format!("  local-llm  {alias}  locked"),
+        Screen::Home => format!("  local-llm  {}{inst}", env!("CARGO_PKG_VERSION")),
+        Screen::Unlock { alias, .. } => format!("  local-llm  {alias}  locked{inst}"),
         Screen::Chat => {
-            let alias = app
+            let (alias, nick) = app
                 .room
                 .as_ref()
-                .and_then(|r| r.try_lock().ok().map(|g| g.alias()))
-                .unwrap_or_else(|| "session".into());
-            format!("  local-llm  {alias}  {} peers", app.peer_count)
+                .and_then(|r| r.try_lock().ok().map(|g| (g.alias(), g.nick.clone())))
+                .unwrap_or_else(|| ("session".into(), "user".into()));
+            format!(
+                "  local-llm  {alias}  {nick}  {} peers{inst}",
+                app.peer_count
+            )
         }
     };
     let p = Paragraph::new(title).style(
@@ -446,7 +483,7 @@ fn draw_home(f: &mut ratatui::Frame, area: Rect, app: &App) {
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "  /new <name>    /join <pin> [ticket]    /forget    /quit",
+        "  /new <name>    /join <pin> [ticket]    /nick <nome>    /forget    /quit",
         Style::default().fg(Color::DarkGray),
     )));
     f.render_widget(Paragraph::new(lines), area);
@@ -484,22 +521,25 @@ fn draw_chat(f: &mut ratatui::Frame, area: Rect, app: &App) {
                         )));
                         lines.push(Line::from(""));
                     }
-                    Record::Chat { author, body, .. } => {
-                        let role = room.role_of(author);
-                        let color = if role == "user" {
+                    rec @ (Record::Chat { .. } | Record::ChatNamed { .. }) => {
+                        let label = room.label_of(rec);
+                        let mine = room.is_mine(rec);
+                        let color = if mine {
                             Color::Rgb(160, 190, 220)
                         } else {
                             Color::Rgb(180, 210, 170)
                         };
                         lines.push(Line::from(Span::styled(
-                            format!("  {role}"),
+                            format!("  {label}"),
                             Style::default().fg(color).add_modifier(Modifier::BOLD),
                         )));
-                        for para in body.split('\n') {
-                            lines.push(Line::from(Span::styled(
-                                format!("  {para}"),
-                                Style::default().fg(Color::Rgb(220, 220, 220)),
-                            )));
+                        if let Some(body) = rec.body() {
+                            for para in body.split('\n') {
+                                lines.push(Line::from(Span::styled(
+                                    format!("  {para}"),
+                                    Style::default().fg(Color::Rgb(220, 220, 220)),
+                                )));
+                            }
                         }
                         lines.push(Line::from(""));
                     }

@@ -11,12 +11,12 @@ local-llm
 ```
 
 ```
-  local-llm  0.1.0
+  local-llm  0.1.2
 
   sessions
   > gpt-oss-20b     locked
 
-  /new <name>    /join <pin> [ticket]    /quit
+  /new <name>    /join <pin> [ticket]    /nick <nome>    /quit
   > _
 ```
 
@@ -25,6 +25,8 @@ local-llm
 | `/new gpt-oss-20b` | cria a sala e mostra o PIN |
 | `/join 7K2M-9QXP` | entra; puxa o histórico dos peers online |
 | `/join 7K2M-9QXP <ticket>` | igual, mas disca um peer na unha (mDNS falhou) |
+| `/nick Diamante` | muda o nome; mensagens antigas ficam com o nome de quando foram enviadas |
+| `/nick` | mostra o nick atual |
 | `/pin` | mostra o PIN de novo (sala destrancada) |
 | `/ticket` | endereço Iroh desta máquina |
 | `/peers` | quantos estão no overlay |
@@ -45,7 +47,7 @@ cargo build --release
 O exe sai em `target\release\local-llm.exe`. Alvo: &lt; 8 MB.
 
 ```powershell
-Compress-Archive -Path target\release\local-llm.exe -DestinationPath local-llm-0.1.0-windows-x64.zip -Force
+Compress-Archive -Path target\release\local-llm.exe -DestinationPath local-llm-0.1.2-windows-x64.zip -Force
 ```
 
 ## Como compartilhar
@@ -61,7 +63,9 @@ Unblock-File .\local-llm.exe
 
 SmartScreen: *More info → Run anyway*. Firewall do Windows: aceitar na **rede privada**. Sem isso o mDNS não acha ninguém.
 
-Variável `LOCAL_LLM_HOME` aponta o diretório de dados (testes). O padrão é `%LOCALAPPDATA%\local-llm\`.
+Duas janelas no mesmo PC (testar sozinho): abre o exe de novo. A segunda vira instância `#2` com identidade própria. Numa você `/new`, na outra `/join PIN` (e o `/ticket` da primeira se o mDNS não achar). Não cole o ticket da **mesma** janela — isso não conecta consigo mesmo.
+
+Variável `LOCAL_LLM_HOME` aponta o diretório de dados. O padrão é `%LOCALAPPDATA%\local-llm\`.
 
 ## Como funciona
 
