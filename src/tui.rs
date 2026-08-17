@@ -1,5 +1,5 @@
 use crate::crypto::Pin;
-use crate::net::{parse_ticket, NetEvent, NetSession};
+use crate::net::{parse_ticket, NetEvent, NetSession, Presence};
 use crate::room::OpenRoom;
 use crate::store::{DataDir, IndexEntry, Record};
 use anyhow::Result;
@@ -393,7 +393,11 @@ async fn enter_chat(app: &mut App, room: OpenRoom, bootstrap: Vec<EndpointAddr>)
     app.screen = Screen::Chat;
     app.scroll = 0;
     app.peer_count = 0;
-    match NetSession::start(secret, shared, tx, bootstrap).await {
+    let presence = Presence {
+        dir: app.dir.presence_dir(),
+        instance: app.dir.instance,
+    };
+    match NetSession::start(secret, shared, tx, bootstrap, presence).await {
         Ok(net) => {
             app.ticket = Some(net.addr());
             app.net = Some(net);

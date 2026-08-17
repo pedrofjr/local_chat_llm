@@ -77,6 +77,7 @@ pub struct IndexEntry {
 
 pub struct DataDir {
     root: PathBuf,
+    base: PathBuf,
     pub instance: u8,
     _slot: Option<TcpListener>,
 }
@@ -103,13 +104,14 @@ impl DataDir {
         };
         let (instance, slot) = claim_instance_slot()?;
         let root = if instance == 1 {
-            base
+            base.clone()
         } else {
             base.join(format!("guest-{instance}"))
         };
         fs::create_dir_all(root.join("rooms")).context("create data dir")?;
         Ok(Self {
             root,
+            base,
             instance,
             _slot: Some(slot),
         })
@@ -119,10 +121,15 @@ impl DataDir {
     pub fn from_path(root: PathBuf) -> Result<Self> {
         fs::create_dir_all(root.join("rooms"))?;
         Ok(Self {
+            base: root.clone(),
             root,
             instance: 1,
             _slot: None,
         })
+    }
+
+    pub fn presence_dir(&self) -> PathBuf {
+        self.base.join("presence")
     }
 
     pub fn nick_path(&self) -> PathBuf {

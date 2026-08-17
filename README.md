@@ -11,7 +11,7 @@ local-llm
 ```
 
 ```
-  local-llm  0.1.2
+  local-llm  0.1.3
 
   sessions
   > gpt-oss-20b     locked
@@ -47,7 +47,7 @@ cargo build --release
 O exe sai em `target\release\local-llm.exe`. Alvo: &lt; 8 MB.
 
 ```powershell
-Compress-Archive -Path target\release\local-llm.exe -DestinationPath local-llm-0.1.2-windows-x64.zip -Force
+Compress-Archive -Path target\release\local-llm.exe -DestinationPath local-llm-0.1.3-windows-x64.zip -Force
 ```
 
 ## Como compartilhar
@@ -63,7 +63,7 @@ Unblock-File .\local-llm.exe
 
 SmartScreen: *More info → Run anyway*. Firewall do Windows: aceitar na **rede privada**. Sem isso o mDNS não acha ninguém.
 
-Duas janelas no mesmo PC (testar sozinho): abre o exe de novo. A segunda vira instância `#2` com identidade própria. Numa você `/new`, na outra `/join PIN` (e o `/ticket` da primeira se o mDNS não achar). Não cole o ticket da **mesma** janela — isso não conecta consigo mesmo.
+Duas janelas no mesmo PC (testar sozinho): abre o exe de novo. A segunda vira instância `#2`. Numa você `/new`, na outra `/join PIN` — elas se acham sozinhas por um arquivo em `%LOCALAPPDATA%\local-llm\presence\` (mDNS no Windows não vê dois processos da mesma máquina). Ticket só precisa se for **outro computador**.
 
 Variável `LOCAL_LLM_HOME` aponta o diretório de dados. O padrão é `%LOCALAPPDATA%\local-llm\`.
 

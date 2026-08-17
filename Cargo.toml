@@ -1,6 +1,6 @@
 [package]
 name = "local-llm"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 description = "LAN P2P room chat that looks like a local LLM terminal"
 license = "MIT"
