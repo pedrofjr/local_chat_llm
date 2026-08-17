@@ -1,0 +1,350 @@
+use crate::crypto::{topic_hex, Pin, RoomKey};
+use anyhow::{anyhow, Context, Result};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::PathBuf;
+
+pub const MAGIC: &[u8; 6] = b"LLLM1\0";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum Record {
+    Meta {
+        alias: String,
+    },
+    Chat {
+        author: [u8; 32],
+        seq: u64,
+        ts: u64,
+        body: String,
+        sig: Vec<u8>,
+    },
+}
+
+impl Record {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        postcard::to_stdvec(self).context("encode record")
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        postcard::from_bytes(bytes).context("decode record")
+    }
+
+    pub fn chat_key(&self) -> Option<([u8; 32], u64)> {
+        match self {
+            Record::Chat { author, seq, .. } => Some((*author, *seq)),
+            Record::Meta { .. } => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct IndexFile {
+    sessions: Vec<IndexEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexEntry {
+    pub alias: String,
+    pub topic: String,
+}
+
+pub struct DataDir {
+    root: PathBuf,
+}
+
+impl DataDir {
+    pub fn open() -> Result<Self> {
+        if let Ok(custom) = std::env::var("LOCAL_LLM_HOME") {
+            let root = PathBuf::from(custom);
+            fs::create_dir_all(root.join("rooms")).ok();
+            return Ok(Self { root });
+        }
+        let base = directories::ProjectDirs::from("dev", "local-llm", "local-llm")
+            .map(|d| d.data_local_dir().to_path_buf())
+            .unwrap_or_else(|| PathBuf::from(".local-llm"));
+        fs::create_dir_all(base.join("rooms")).context("create data dir")?;
+        Ok(Self { root: base })
+    }
+
+    #[cfg(test)]
+    pub fn from_path(root: PathBuf) -> Result<Self> {
+        fs::create_dir_all(root.join("rooms"))?;
+        Ok(Self { root })
+    }
+
+    pub fn device_key_path(&self) -> PathBuf {
+        self.root.join("device.key")
+    }
+
+    pub fn index_path(&self) -> PathBuf {
+        self.root.join("index.toml")
+    }
+
+    pub fn room_dir(&self, topic: &[u8; 32]) -> PathBuf {
+        self.root.join("rooms").join(topic_hex(topic))
+    }
+
+    pub fn list_sessions(&self) -> Result<Vec<IndexEntry>> {
+        if !self.index_path().exists() {
+            return Ok(Vec::new());
+        }
+        let text = fs::read_to_string(self.index_path())?;
+        let file: IndexFile = toml::from_str(&text).context("parse index.toml")?;
+        Ok(file.sessions)
+    }
+
+    pub fn upsert_session(&self, alias: &str, topic: &[u8; 32]) -> Result<()> {
+        let hex = topic_hex(topic);
+        let mut sessions = self.list_sessions()?;
+        if let Some(existing) = sessions.iter_mut().find(|s| s.topic == hex) {
+            if !alias.is_empty() {
+                existing.alias = alias.to_string();
+            }
+        } else {
+            sessions.push(IndexEntry {
+                alias: if alias.is_empty() {
+                    "session".into()
+                } else {
+                    alias.into()
+                },
+                topic: hex,
+            });
+        }
+        let text = toml::to_string_pretty(&IndexFile { sessions })?;
+        fs::write(self.index_path(), text)?;
+        Ok(())
+    }
+
+    pub fn forget(&self, topic: &[u8; 32]) -> Result<()> {
+        let hex = topic_hex(topic);
+        let sessions: Vec<_> = self
+            .list_sessions()?
+            .into_iter()
+            .filter(|s| s.topic != hex)
+            .collect();
+        fs::write(
+            self.index_path(),
+            toml::to_string_pretty(&IndexFile { sessions })?,
+        )?;
+        let dir = self.room_dir(topic);
+        if dir.exists() {
+            fs::remove_dir_all(dir)?;
+        }
+        Ok(())
+    }
+}
+
+pub struct RoomLog {
+    path: PathBuf,
+    key: RoomKey,
+    records: Vec<Record>,
+    seen: BTreeMap<([u8; 32], u64), ()>,
+}
+
+impl RoomLog {
+    pub fn open_or_create(dir: &DataDir, pin: &Pin, alias: Option<&str>) -> Result<Self> {
+        let topic = crate::crypto::topic_id(pin);
+        let key = RoomKey::derive(pin)?;
+        let room = dir.room_dir(&topic);
+        fs::create_dir_all(&room)?;
+        let path = room.join("log.bin");
+        let log = if path.exists() {
+            Self::load(path, key)?
+        } else {
+            let mut log = Self {
+                path,
+                key,
+                records: Vec::new(),
+                seen: BTreeMap::new(),
+            };
+            if let Some(alias) = alias {
+                log.append(Record::Meta {
+                    alias: alias.to_string(),
+                })?;
+            }
+            log
+        };
+        let shown = log
+            .alias()
+            .unwrap_or_else(|| alias.unwrap_or("session").to_string());
+        dir.upsert_session(&shown, &topic)?;
+        Ok(log)
+    }
+
+    fn load(path: PathBuf, key: RoomKey) -> Result<Self> {
+        let bytes = fs::read(&path).context("read log")?;
+        if bytes.len() < MAGIC.len() || &bytes[..MAGIC.len()] != MAGIC {
+            return Err(anyhow!("not a local-llm log"));
+        }
+        let mut records = Vec::new();
+        let mut seen = BTreeMap::new();
+        let mut offset = MAGIC.len();
+        while offset + 4 <= bytes.len() {
+            let len = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
+            offset += 4;
+            if offset + len > bytes.len() {
+                return Err(anyhow!("truncated log"));
+            }
+            let plain = key.open(&bytes[offset..offset + len])?;
+            offset += len;
+            let rec = Record::decode(&plain)?;
+            if let Some(key) = rec.chat_key() {
+                seen.insert(key, ());
+            }
+            records.push(rec);
+        }
+        Ok(Self {
+            path,
+            key,
+            records,
+            seen,
+        })
+    }
+
+    pub fn records(&self) -> &[Record] {
+        &self.records
+    }
+
+    pub fn alias(&self) -> Option<String> {
+        self.records.iter().rev().find_map(|r| match r {
+            Record::Meta { alias } => Some(alias.clone()),
+            _ => None,
+        })
+    }
+
+    pub fn next_seq_for(&self, author: &[u8; 32]) -> u64 {
+        self.heads().get(author).map(|s| s + 1).unwrap_or(0)
+    }
+
+    pub fn heads(&self) -> BTreeMap<[u8; 32], u64> {
+        let mut heads = BTreeMap::new();
+        for rec in &self.records {
+            if let Record::Chat { author, seq, .. } = rec {
+                heads
+                    .entry(*author)
+                    .and_modify(|s: &mut u64| *s = (*s).max(*seq))
+                    .or_insert(*seq);
+            }
+        }
+        heads
+    }
+
+    pub fn missing_for(&self, their: &BTreeMap<[u8; 32], u64>) -> Vec<Record> {
+        self.records
+            .iter()
+            .filter(|rec| match rec {
+                Record::Meta { .. } => true,
+                Record::Chat { author, seq, .. } => their.get(author).is_none_or(|h| *seq > *h),
+            })
+            .cloned()
+            .collect()
+    }
+
+    pub fn append(&mut self, rec: Record) -> Result<bool> {
+        if let Some(key) = rec.chat_key() {
+            if self.seen.contains_key(&key) {
+                return Ok(false);
+            }
+            self.seen.insert(key, ());
+        }
+        let sealed = self.key.seal(&rec.encode()?)?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
+        if file.metadata()?.len() == 0 {
+            file.write_all(MAGIC)?;
+        }
+        let len = u32::try_from(sealed.len()).context("record too large")?;
+        file.write_all(&len.to_le_bytes())?;
+        file.write_all(&sealed)?;
+        file.flush()?;
+        self.records.push(rec);
+        Ok(true)
+    }
+
+    #[cfg(test)]
+    pub fn merge(&mut self, incoming: Vec<Record>) -> Result<usize> {
+        let mut added = 0;
+        for rec in incoming {
+            if self.append(rec)? {
+                added += 1;
+            }
+        }
+        Ok(added)
+    }
+}
+
+pub fn now_ts() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto::Pin;
+    use tempfile::TempDir;
+
+    #[test]
+    fn persist_and_reload() {
+        let tmp = TempDir::new().unwrap();
+        let dir = DataDir::from_path(tmp.path().to_path_buf()).unwrap();
+        let pin = Pin::parse("7K2M-9QXP").unwrap();
+        {
+            let mut log = RoomLog::open_or_create(&dir, &pin, Some("gpt-oss-20b")).unwrap();
+            log.append(Record::Chat {
+                author: [1u8; 32],
+                seq: 0,
+                ts: 1,
+                body: "hi".into(),
+                sig: vec![0u8; 64],
+            })
+            .unwrap();
+        }
+        let log = RoomLog::open_or_create(&dir, &pin, None).unwrap();
+        assert_eq!(log.alias().as_deref(), Some("gpt-oss-20b"));
+        assert_eq!(log.records().len(), 2);
+        match &log.records()[1] {
+            Record::Chat { body, .. } => assert_eq!(body, "hi"),
+            _ => panic!("expected chat"),
+        }
+        let sessions = dir.list_sessions().unwrap();
+        assert_eq!(sessions[0].alias, "gpt-oss-20b");
+    }
+
+    #[test]
+    fn merge_is_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        let dir = DataDir::from_path(tmp.path().to_path_buf()).unwrap();
+        let pin = Pin::parse("AAAA-BBBB").unwrap();
+        let mut a = RoomLog::open_or_create(&dir, &pin, Some("qwen")).unwrap();
+        let rec = Record::Chat {
+            author: [2u8; 32],
+            seq: 3,
+            ts: 9,
+            body: "once".into(),
+            sig: vec![7u8; 64],
+        };
+        assert_eq!(a.merge(vec![rec.clone()]).unwrap(), 1);
+        assert_eq!(a.merge(vec![rec]).unwrap(), 0);
+        assert_eq!(a.heads().get(&[2u8; 32]).copied(), Some(3));
+    }
+
+    #[test]
+    fn forget_wipes_room() {
+        let tmp = TempDir::new().unwrap();
+        let dir = DataDir::from_path(tmp.path().to_path_buf()).unwrap();
+        let pin = Pin::parse("CCCC-DDDD").unwrap();
+        let topic = crate::crypto::topic_id(&pin);
+        RoomLog::open_or_create(&dir, &pin, Some("gone")).unwrap();
+        assert!(!dir.list_sessions().unwrap().is_empty());
+        dir.forget(&topic).unwrap();
+        assert!(dir.list_sessions().unwrap().is_empty());
+        assert!(!dir.room_dir(&topic).exists());
+    }
+}

@@ -1,0 +1,39 @@
+[package]
+name = "local-llm"
+version = "0.1.0"
+edition = "2021"
+description = "LAN P2P room chat that looks like a local LLM terminal"
+license = "MIT"
+publish = false
+
+[dependencies]
+anyhow = "1"
+bytes = "1"
+argon2 = { version = "0.5", default-features = false, features = ["std", "alloc", "password-hash"] }
+blake3 = "1"
+chacha20poly1305 = "0.10"
+crossterm = { version = "0.28", features = ["event-stream"] }
+data-encoding = "2"
+directories = "6"
+futures-lite = "2"
+iroh = "1"
+iroh-gossip = "0.101"
+iroh-mdns-address-lookup = "0.4"
+postcard = { version = "1", default-features = false, features = ["alloc", "use-std"] }
+rand = "0.8"
+ratatui = "0.29"
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio-stream = "0.1"
+toml = "0.8"
+zeroize = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+opt-level = "s"
+strip = true
+panic = "abort"
