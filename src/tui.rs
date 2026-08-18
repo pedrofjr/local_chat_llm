@@ -18,7 +18,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::{Frame, Terminal};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Stdout, Write};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -31,6 +31,9 @@ const HOME_HINT: &str = "/new <name>   /join <key>   /nick <name>   /help   /qui
 const CHAT_HINT: &str = "/help for commands   f12 hides names   esc clears the line";
 /// What the status bar says while the disguise is on. Never mentions peers.
 const MASKED_STATUS: &str = "loaded · q4_k_m · 8192 ctx · 24 layers on gpu";
+/// Two key events closer together than this came from the terminal, not from
+/// fingers. Pasting is the only thing that produces it.
+const PASTE_GAP: Duration = Duration::from_millis(10);
 /// Most recent transcript entries laid out per frame. Older ones stay in the
 /// log and come back when the room is reopened.
 const RENDER_CAP: usize = 800;
@@ -238,6 +241,15 @@ pub struct App {
     picked: Option<usize>,
     /// Message the next thing you send will answer.
     replying: Option<([u8; 32], u64)>,
+    /// Messages blurred on this screen. Local preference: nothing about it
+    /// goes into the log or out to the peers.
+    hidden: HashSet<([u8; 32], u64)>,
+    /// Bumped on every change, so the layout cache notices. A plain count
+    /// would miss hide-then-show.
+    hidden_rev: u64,
+    /// Set by a click on the hide icon and consumed by the event loop, which
+    /// can await the write that the mouse handler cannot.
+    pending_hide: Option<usize>,
 }
 
 impl App {
@@ -278,6 +290,9 @@ impl App {
             hover: None,
             picked: None,
             replying: None,
+            hidden: HashSet::new(),
+            hidden_rev: 0,
+            pending_hide: None,
         };
         app.refresh_sessions();
         Ok(app)
@@ -325,6 +340,8 @@ impl App {
         self.hover = None;
         self.picked = None;
         self.replying = None;
+        self.hidden.clear();
+        self.hidden_rev += 1;
         self.unread = 0;
         self.follow = true;
         self.scroll = 0;
@@ -367,6 +384,9 @@ impl App {
         }
         if anchor.copy.contains(&column) {
             return Some(Action::Copy);
+        }
+        if anchor.hide.contains(&column) {
+            return Some(Action::Hide);
         }
         None
     }
@@ -460,26 +480,42 @@ pub async fn run() -> Result<()> {
     result
 }
 
-fn spawn_input_thread() -> mpsc::UnboundedReceiver<Event> {
+/// Reads the terminal, tagging each event with whether it arrived as part of a
+/// burst. crossterm has no bracketed paste on Windows -- `Event::Paste` is
+/// parsed only on unix -- so a pasted block shows up as ordinary key events,
+/// and every newline in it looks exactly like the user pressing Enter. A burst
+/// is the one thing that tells them apart: either another event is already
+/// queued, or the previous one landed microseconds ago. Human typing does
+/// neither.
+fn spawn_input_thread() -> mpsc::UnboundedReceiver<(Event, bool)> {
     let (tx, rx) = mpsc::unbounded_channel();
     std::thread::Builder::new()
         .name("input".into())
-        .spawn(move || loop {
-            match event::poll(Duration::from_millis(200)) {
-                Ok(true) => match event::read() {
-                    Ok(ev) => {
-                        if tx.send(ev).is_err() {
+        .spawn(move || {
+            let mut previous: Option<Instant> = None;
+            loop {
+                match event::poll(Duration::from_millis(200)) {
+                    Ok(true) => match event::read() {
+                        Ok(ev) => {
+                            let queued = matches!(event::poll(Duration::ZERO), Ok(true));
+                            let now = Instant::now();
+                            let hurried =
+                                previous.is_some_and(|at| now.duration_since(at) < PASTE_GAP);
+                            previous = Some(now);
+                            if tx.send((ev, queued || hurried)).is_err() {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    },
+                    Ok(false) => {
+                        previous = None;
+                        if tx.is_closed() {
                             break;
                         }
                     }
                     Err(_) => break,
-                },
-                Ok(false) => {
-                    if tx.is_closed() {
-                        break;
-                    }
                 }
-                Err(_) => break,
             }
         })
         .expect("input thread");
@@ -493,19 +529,24 @@ async fn run_inner(terminal: &mut Term) -> Result<()> {
         terminal.draw(|f| draw(f, &mut app))?;
         tokio::select! {
             maybe = events.recv() => {
-                let Some(ev) = maybe else { continue };
+                let Some((ev, pasting)) = maybe else { continue };
                 match ev {
                     Event::Key(key) => {
                         // Windows reports press and release; only one is input.
                         if key.kind == KeyEventKind::Release {
                             continue;
                         }
-                        if handle_key(&mut app, key, terminal).await? {
+                        if handle_key(&mut app, key, terminal, pasting).await? {
                             break;
                         }
                     }
                     Event::Paste(text) => paste(&mut app, &text),
-                    Event::Mouse(m) => handle_mouse(&mut app, m),
+                    Event::Mouse(m) => {
+                        handle_mouse(&mut app, m);
+                        if let Some(idx) = app.pending_hide.take() {
+                            toggle_hidden(&mut app, idx).await;
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -668,6 +709,7 @@ async fn handle_key<B: Backend>(
     app: &mut App,
     key: KeyEvent,
     term: &mut Terminal<B>,
+    pasting: bool,
 ) -> Result<bool> {
     if is_shortcut(&key) && matches!(key.code, KeyCode::Char('c')) {
         return Ok(true);
@@ -711,7 +753,7 @@ async fn handle_key<B: Backend>(
     match app.screen.clone() {
         Screen::Home => handle_home(app, key, term).await,
         Screen::Unlock { alias, topic } => handle_unlock(app, key, term, &alias, topic).await,
-        Screen::Chat => handle_chat(app, key, term).await,
+        Screen::Chat => handle_chat(app, key, term, pasting).await,
         Screen::Help | Screen::Confirm { .. } => Ok(false),
     }
 }
@@ -720,6 +762,49 @@ async fn handle_key<B: Backend>(
 enum Action {
     Reply,
     Copy,
+    Hide,
+}
+
+const HIDDEN_FILE: &str = "hidden.bin";
+
+async fn load_hidden(app: &mut App) {
+    let Some(room) = app.room.clone() else { return };
+    let stored = room.lock().await.log.read_side(HIDDEN_FILE);
+    app.hidden = stored
+        .and_then(|bytes| postcard::from_bytes::<Vec<([u8; 32], u64)>>(&bytes).ok())
+        .map(|list| list.into_iter().collect())
+        .unwrap_or_default();
+    app.hidden_rev += 1;
+}
+
+async fn save_hidden(app: &App) {
+    let Some(room) = app.room.clone() else { return };
+    let list: Vec<([u8; 32], u64)> = app.hidden.iter().copied().collect();
+    if let Ok(bytes) = postcard::to_stdvec(&list) {
+        let _ = room.lock().await.log.write_side(HIDDEN_FILE, &bytes);
+    }
+}
+
+/// Blurs a message, or brings it back. Toggling leaves it revealed until you
+/// hide it again -- no timer, nothing surprising.
+async fn toggle_hidden(app: &mut App, idx: usize) {
+    let Some(Feed::Msg { author, seq, .. }) = app.feed.get(idx) else {
+        return;
+    };
+    let key = (*author, *seq);
+    let blurred = if app.hidden.remove(&key) {
+        false
+    } else {
+        app.hidden.insert(key);
+        true
+    };
+    app.hidden_rev += 1;
+    app.status = if blurred {
+        "message hidden on this screen only".into()
+    } else {
+        "message shown again".into()
+    };
+    save_hidden(app).await;
 }
 
 /// Points the next message at `idx`.
@@ -821,6 +906,9 @@ fn handle_mouse(app: &mut App, ev: crossterm::event::MouseEvent) {
             match app.action_at(ev.row, ev.column) {
                 Some(Action::Reply) => arm_reply(app, idx),
                 Some(Action::Copy) => copy_message(app, idx),
+                // Hiding writes to disk, which the mouse handler cannot await;
+                // the click marks the message and the key does the rest.
+                Some(Action::Hide) => app.pending_hide = Some(idx),
                 None => app.picked = Some(idx),
             }
         }
@@ -965,6 +1053,7 @@ async fn handle_chat<B: Backend>(
     app: &mut App,
     key: KeyEvent,
     term: &mut Terminal<B>,
+    pasting: bool,
 ) -> Result<bool> {
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
@@ -991,6 +1080,10 @@ async fn handle_chat<B: Backend>(
             Some(idx) => arm_reply(app, idx),
             None => app.status = "alt+up picks a message to answer".into(),
         },
+        KeyCode::Char('h') if is_shortcut(&key) => match app.picked.or(app.hover) {
+            Some(idx) => toggle_hidden(app, idx).await,
+            None => app.status = "alt+up picks a message to hide".into(),
+        },
         KeyCode::Char('y') if is_shortcut(&key) => match app.picked.or(app.hover) {
             Some(idx) => copy_message(app, idx),
             None => app.status = "alt+up picks a message to copy".into(),
@@ -1010,7 +1103,8 @@ async fn handle_chat<B: Backend>(
         }
         KeyCode::Up => app.input.recall_prev(),
         KeyCode::Down => app.input.recall_next(),
-        KeyCode::Enter if shift => app.input.insert('\n'),
+        // A newline inside a paste belongs to the message, not to the send key.
+        KeyCode::Enter if shift || pasting => app.input.insert('\n'),
         KeyCode::Enter => {
             let line = app.input.take();
             let trimmed = line.trim();
@@ -1236,8 +1330,12 @@ async fn diag(app: &mut App) {
         if app.net.is_some() { "up" } else { "down" },
         app.peers.len()
     ));
+    let remembered = match app.room.clone() {
+        Some(room) => crate::net::load_peers(&*room.lock().await).len(),
+        None => 0,
+    };
     app.notice(format!(
-        "presence dir {} ({files} file(s))",
+        "presence dir {} ({files} file(s)) · {remembered} peer(s) remembered from before",
         presence.display()
     ));
     if app.peers.is_empty() {
@@ -1281,6 +1379,7 @@ async fn start_session(app: &mut App, room: OpenRoom, bootstrap: Vec<EndpointAdd
     app.screen = Screen::Chat;
     app.status = CHAT_HINT.into();
     sync_feed(app).await;
+    load_hidden(app).await;
     // Escape hatch for a machine where the firewall says no: the history is
     // still readable and writable, it just does not go anywhere.
     if std::env::var_os("LOCAL_LLM_OFFLINE").is_some() {
@@ -1485,6 +1584,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         ("alt+up / alt+down", "pick a message"),
         ("ctrl+r", "answer the picked message (or click the icon)"),
         ("ctrl+y", "copy it (or click the icon)"),
+        ("ctrl+h", "blur it on this screen only (or click the icon)"),
         ("f12", "hide names and notices instantly"),
         ("pgup / pgdn", "scroll — mouse wheel works too"),
         ("ctrl+end", "jump back to the newest message"),
@@ -1561,6 +1661,7 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
         hover: app.hover,
         picked: app.picked,
         replying: app.replying,
+        hidden_rev: app.hidden_rev,
     };
     if app.rendered.as_ref().map(|r| r.key) != Some(key) {
         let layout = build_lines(app, area.width);
@@ -1758,6 +1859,7 @@ struct ActionAnchor {
     line: usize,
     reply: std::ops::Range<u16>,
     copy: std::ops::Range<u16>,
+    hide: std::ops::Range<u16>,
 }
 
 struct Transcript {
@@ -1776,6 +1878,7 @@ struct RenderKey {
     hover: Option<usize>,
     picked: Option<usize>,
     replying: Option<([u8; 32], u64)>,
+    hidden_rev: u64,
 }
 
 /// Collects lines together with their owning feed item, so the two can never
@@ -1796,35 +1899,72 @@ impl Sink {
         self.push(Line::from(""), owner);
     }
 
-    /// Records that the icons live on the line about to be pushed.
-    fn arm(&mut self, reply_at: u16, copy_at: u16) {
-        self.actions = Some(ActionAnchor {
-            line: self.lines.len(),
-            reply: reply_at..reply_at + ACTION_WIDTH,
-            copy: copy_at..copy_at + ACTION_WIDTH,
-        });
+    fn arm(&mut self, anchor: ActionAnchor) {
+        self.actions = Some(anchor);
     }
 }
 
-/// Columns each icon occupies, for hit testing.
-const ACTION_WIDTH: u16 = 7;
 const REPLY_ICON: &str = "↩";
 const COPY_ICON: &str = "⧉";
+const HIDE_ICON: &str = "▨";
 const QUOTE_MARK: &str = "┌";
 const WHISPER_MARK: &str = "→";
+const BLOCK: char = '█';
+/// Below this the ruler drops its words and shows bare icons, so it never
+/// pushes a message off the edge on a narrow terminal.
+const ROOM_FOR_WORDS: usize = 70;
 
-fn action_spans() -> Vec<Span<'static>> {
-    vec![
-        Span::styled(
-            format!("{REPLY_ICON} reply"),
-            Style::default().fg(Color::Rgb(150, 170, 200)),
-        ),
-        Span::raw("  "),
-        Span::styled(
-            format!("{COPY_ICON} copy"),
-            Style::default().fg(Color::Rgb(150, 170, 200)),
-        ),
-    ]
+fn action_labels(hidden: bool, compact: bool) -> [&'static str; 3] {
+    if compact {
+        [REPLY_ICON, COPY_ICON, HIDE_ICON]
+    } else if hidden {
+        ["↩ reply", "⧉ copy", "▨ show"]
+    } else {
+        ["↩ reply", "⧉ copy", "▨ hide"]
+    }
+}
+
+fn ruler_width(hidden: bool, compact: bool) -> usize {
+    action_labels(hidden, compact)
+        .iter()
+        .map(|label| label.chars().count())
+        .sum::<usize>()
+        + 4
+}
+
+/// Builds the hover ruler and records the columns each icon landed on, so a
+/// click can be attributed to the right action.
+fn action_ruler(hidden: bool, compact: bool, at: u16, line: usize) -> (Vec<Span<'static>>, ActionAnchor) {
+    let tint = Style::default().fg(Color::Rgb(150, 170, 200));
+    let mut spans = Vec::new();
+    let mut spans_at = Vec::new();
+    let mut col = at;
+    for (index, label) in action_labels(hidden, compact).iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::raw("  "));
+            col += 2;
+        }
+        let width = label.chars().count() as u16;
+        spans_at.push(col..col + width);
+        spans.push(Span::styled(label.to_string(), tint));
+        col += width;
+    }
+    let anchor = ActionAnchor {
+        line,
+        reply: spans_at[0].clone(),
+        copy: spans_at[1].clone(),
+        hide: spans_at[2].clone(),
+    };
+    (spans, anchor)
+}
+
+/// Replaces every character with a block, keeping the shape so you can tell a
+/// message is there. This is what gets rendered -- the original text never
+/// reaches the screen buffer.
+fn blur(body: &str) -> String {
+    body.chars()
+        .map(|c| if c == '\n' { '\n' } else { BLOCK })
+        .collect()
 }
 
 /// First line of a body, cut to fit a quote.
@@ -1845,6 +1985,7 @@ fn build_lines(app: &App, width: u16) -> Transcript {
     // two columns instead of one ragged block.
     let edge = (width as usize).saturating_sub(2);
     let bubble = if inner <= 32 { inner } else { (inner * 7) / 10 };
+    let compact = inner < ROOM_FOR_WORDS;
     let mut sink = Sink {
         lines: Vec::new(),
         owners: Vec::new(),
@@ -1880,13 +2021,13 @@ fn build_lines(app: &App, width: u16) -> Transcript {
             }
             Feed::Msg {
                 author,
+                seq,
                 name,
                 mine,
                 body,
                 ts,
                 reply_to,
                 whisper,
-                ..
             } => {
                 // A whisper is the most sensitive thing on screen, so the
                 // disguise drops it entirely rather than relabelling it.
@@ -1919,6 +2060,14 @@ fn build_lines(app: &App, width: u16) -> Transcript {
                     None => format!("{QUOTE_MARK} (message not here yet)"),
                 });
                 let armed = !app.masked && (app.hover == Some(idx) || app.picked == Some(idx));
+                let hidden_here = app.hidden.contains(&(*author, *seq));
+                // The blur is built here, so the real text never reaches the
+                // screen buffer at all.
+                let shown = if hidden_here {
+                    blur(body)
+                } else {
+                    body.clone()
+                };
                 let label = if app.masked {
                     if *mine {
                         "user".to_string()
@@ -1955,7 +2104,11 @@ fn build_lines(app: &App, width: u16) -> Transcript {
                         Color::Rgb(r, g, b)
                     })
                     .add_modifier(Modifier::BOLD);
-                let body_style = Style::default().fg(Color::Rgb(220, 220, 220));
+                let body_style = if hidden_here {
+                    dim()
+                } else {
+                    Style::default().fg(Color::Rgb(220, 220, 220))
+                };
 
                 // Your own messages hug the right edge, the way every chat does
                 // it. The disguise turns that off: an inference log is flush
@@ -1970,26 +2123,25 @@ fn build_lines(app: &App, width: u16) -> Transcript {
                     // Icons sit to the left of a right-aligned header, so they
                     // widen the block instead of pushing it off the edge.
                     let icons = if armed {
-                        ACTION_WIDTH as usize * 2 + 2 + 3
+                        ruler_width(hidden_here, compact) + 3
                     } else {
                         0
                     };
                     head_width += icons;
                     let lead = indent(edge, head_width);
-                    let mut head: Vec<Span> = Vec::new();
-                    let mut col = lead.chars().count() as u16;
-                    head.push(Span::raw(lead));
+                    let col = lead.chars().count() as u16;
+                    let mut head: Vec<Span> = vec![Span::raw(lead)];
                     if armed {
-                        sink.arm(col, col + ACTION_WIDTH + 2);
-                        head.extend(action_spans());
+                        let (spans, anchor) =
+                            action_ruler(hidden_here, compact, col, sink.lines.len());
+                        head.extend(spans);
                         head.push(Span::raw("   "));
-                        col += icons as u16;
+                        sink.arm(anchor);
                     }
-                    let _ = col;
                     head.push(Span::styled(stamp, dim()));
                     head.push(Span::styled(format!("  {label}"), head_style));
                     sink.push(Line::from(head), Some(idx));
-                    for piece in wrap_text(body, bubble) {
+                    for piece in wrap_text(&shown, bubble) {
                         let pad = indent(edge, piece.chars().count());
                         sink.push(
                             Line::from(Span::styled(pad + &piece, body_style)),
@@ -2013,11 +2165,13 @@ fn build_lines(app: &App, width: u16) -> Transcript {
                     if armed {
                         head.push(Span::raw("   "));
                         col += 3;
-                        sink.arm(col, col + ACTION_WIDTH + 2);
-                        head.extend(action_spans());
+                        let (spans, anchor) =
+                            action_ruler(hidden_here, compact, col, sink.lines.len());
+                        head.extend(spans);
+                        sink.arm(anchor);
                     }
                     sink.push(Line::from(head), Some(idx));
-                    for piece in wrap_text(body, if app.masked { inner } else { bubble }) {
+                    for piece in wrap_text(&shown, if app.masked { inner } else { bubble }) {
                         sink.push(
                             Line::from(Span::styled(format!("  {piece}"), body_style)),
                             Some(idx),
@@ -2154,9 +2308,20 @@ mod tests {
                 .unwrap();
         }
 
+        /// A keystroke the terminal delivered as part of a burst, which is
+        /// what a paste looks like on Windows.
+        async fn paste_key(&mut self, code: KeyCode) {
+            let key = KeyEvent::new(code, KeyModifiers::NONE);
+            handle_key(&mut self.app, key, &mut self.term, true)
+                .await
+                .unwrap();
+        }
+
         async fn press(&mut self, code: KeyCode) {
             let key = KeyEvent::new(code, KeyModifiers::NONE);
-            handle_key(&mut self.app, key, &mut self.term).await.unwrap();
+            handle_key(&mut self.app, key, &mut self.term, false)
+                .await
+                .unwrap();
         }
 
         fn transcript(&self) -> String {
@@ -2338,6 +2503,152 @@ mod tests {
             .expect("a message should be on screen")
     }
 
+    async fn record_count(app: &App) -> usize {
+        app.room.as_ref().unwrap().lock().await.log.records().len()
+    }
+
+    #[tokio::test]
+    async fn hiding_blurs_the_text_without_touching_the_log() {
+        let mut h = Harness::new();
+        h.cmd("/nick Pedro").await;
+        h.cmd("/new gpt-oss-20b").await;
+        push_peer(&mut h.app, [9u8; 32], 3, "Dale", "coisa pesada demais");
+        h.painted();
+
+        let idx = h.app.feed.len() - 1;
+        let before = record_count(&h.app).await;
+
+        toggle_hidden(&mut h.app, idx).await;
+        let painted = h.painted();
+        assert!(
+            !painted.contains("coisa pesada"),
+            "hidden text must never reach the screen buffer"
+        );
+        assert!(painted.contains(BLOCK), "the shape of the message should stay");
+        assert!(
+            painted.contains("Dale"),
+            "you should still see that Dale said something"
+        );
+        assert_eq!(
+            record_count(&h.app).await,
+            before,
+            "hiding is a local preference, not an edit to the room"
+        );
+
+        // Toggling brings it back and leaves it back.
+        toggle_hidden(&mut h.app, idx).await;
+        assert!(h.painted().contains("coisa pesada"));
+        assert!(h.painted().contains("coisa pesada"));
+    }
+
+    #[tokio::test]
+    async fn hidden_messages_are_still_hidden_next_time() {
+        let mut h = Harness::new();
+        h.cmd("/new gpt-oss-20b").await;
+        push_peer(&mut h.app, [9u8; 32], 3, "Dale", "nao quero isso na tela");
+        let last = h.app.feed.len() - 1;
+        toggle_hidden(&mut h.app, last).await;
+        let kept: Vec<_> = h.app.hidden.iter().copied().collect();
+        assert_eq!(kept.len(), 1);
+
+        // Reopening the room reloads the preference from the sealed side file.
+        h.app.hidden.clear();
+        load_hidden(&mut h.app).await;
+        assert_eq!(h.app.hidden.iter().copied().collect::<Vec<_>>(), kept);
+    }
+
+    #[tokio::test]
+    async fn the_hide_icon_is_clickable_and_says_what_it_will_do() {
+        use crossterm::event::{MouseButton, MouseEventKind};
+
+        let mut h = Harness::new();
+        h.cmd("/new gpt-oss-20b").await;
+        push_peer(&mut h.app, [9u8; 32], 3, "Dale", "segredo");
+        h.painted();
+
+        let row = first_message_row(&h.app);
+        mouse(&mut h.app, MouseEventKind::Moved, row, 4);
+        let shown = h.painted();
+        assert!(shown.contains("hide"), "the ruler should offer hiding");
+
+        let anchor = h
+            .app
+            .rendered
+            .as_ref()
+            .unwrap()
+            .layout
+            .actions
+            .clone()
+            .expect("ruler anchored");
+        let icon_row = h.app.chat_area.y + (anchor.line as u16 - h.app.scroll);
+        mouse(
+            &mut h.app,
+            MouseEventKind::Down(MouseButton::Left),
+            icon_row,
+            anchor.hide.start,
+        );
+        // The click only marks it; the loop performs the write.
+        let idx = h.app.pending_hide.take().expect("click should ask to hide");
+        toggle_hidden(&mut h.app, idx).await;
+
+        assert!(!h.painted().contains("segredo"));
+        // And the ruler now offers the way back.
+        mouse(&mut h.app, MouseEventKind::Moved, row, 4);
+        assert!(h.painted().contains("show"));
+    }
+
+    #[tokio::test]
+    async fn a_pasted_block_arrives_as_one_message() {
+        let mut h = Harness::new();
+        h.cmd("/new gpt-oss-20b").await;
+        let before = h.app.feed.len();
+
+        // What the console hands over when two lines are pasted: plain key
+        // events, the newline among them indistinguishable from Enter except
+        // for arriving in a burst.
+        for ch in "linha um".chars() {
+            h.paste_key(KeyCode::Char(ch)).await;
+        }
+        h.paste_key(KeyCode::Enter).await;
+        for ch in "linha dois".chars() {
+            h.paste_key(KeyCode::Char(ch)).await;
+        }
+        // The send is a real keypress, on its own.
+        h.press(KeyCode::Enter).await;
+
+        assert_eq!(
+            h.app.feed.len() - before,
+            1,
+            "a paste must not be chopped into one message per line"
+        );
+        match h.app.feed.last().unwrap() {
+            Feed::Msg { body, .. } => assert_eq!(body, "linha um\nlinha dois"),
+            _ => panic!("expected a message"),
+        }
+    }
+
+    #[tokio::test]
+    async fn typing_enter_still_sends() {
+        let mut h = Harness::new();
+        h.cmd("/new gpt-oss-20b").await;
+        let before = h.app.feed.len();
+
+        for ch in "primeira".chars() {
+            h.press(KeyCode::Char(ch)).await;
+        }
+        h.press(KeyCode::Enter).await;
+        for ch in "segunda".chars() {
+            h.press(KeyCode::Char(ch)).await;
+        }
+        h.press(KeyCode::Enter).await;
+
+        assert_eq!(
+            h.app.feed.len() - before,
+            2,
+            "typed Enter must keep sending, burst detection is not a mode"
+        );
+    }
+
     #[tokio::test]
     async fn a_reply_carries_a_pointer_and_shows_a_quote() {
         let mut h = Harness::new();
@@ -2389,20 +2700,20 @@ mod tests {
 
         // Nothing picked yet: the first step lands on the newest message.
         let alt_up = KeyEvent::new(KeyCode::Up, KeyModifiers::ALT);
-        handle_key(&mut h.app, alt_up, &mut h.term).await.unwrap();
+        handle_key(&mut h.app, alt_up, &mut h.term, false).await.unwrap();
         match &h.app.feed[h.app.picked.expect("something picked")] {
             Feed::Msg { body, .. } => assert_eq!(body, "segunda"),
             _ => panic!("expected a message"),
         }
 
-        handle_key(&mut h.app, alt_up, &mut h.term).await.unwrap();
+        handle_key(&mut h.app, alt_up, &mut h.term, false).await.unwrap();
         match &h.app.feed[h.app.picked.unwrap()] {
             Feed::Msg { body, .. } => assert_eq!(body, "primeira"),
             _ => panic!("expected a message"),
         }
 
         let ctrl_r = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL);
-        handle_key(&mut h.app, ctrl_r, &mut h.term).await.unwrap();
+        handle_key(&mut h.app, ctrl_r, &mut h.term, false).await.unwrap();
         assert!(h.app.replying.is_some(), "ctrl+r should arm the reply");
         assert!(h.painted().contains("replying to"));
 
@@ -2682,6 +2993,9 @@ mod tests {
             reply_to: None,
             whisper: Some(me),
         });
+        push_peer(&mut h.app, [9u8; 32], 11, "Dale", "e aquele cliente chato de novo");
+        let heavy = h.app.feed.len() - 1;
+        toggle_hidden(&mut h.app, heavy).await;
         h.app.input.insert_str("ate amanha");
         h.painted();
 
@@ -2813,7 +3127,7 @@ mod tests {
 
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
-        handle_key(&mut app, enter, &mut term).await.unwrap();
+        handle_key(&mut app, enter, &mut term, false).await.unwrap();
         assert!(
             matches!(app.screen, Screen::Chat),
             "a remembered session must not ask for the key again"

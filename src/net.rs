@@ -25,6 +25,28 @@ use tokio::sync::{mpsc, Mutex};
 /// which is a better failure than half-understood traffic.
 pub const SYNC_ALPN: &[u8] = b"local-llm/2";
 
+/// Peer addresses from previous sessions, sealed with the room key inside the
+/// room folder. Without this, coming back to a room means asking a colleague
+/// for a ticket even though the room itself is already on disk.
+const PEERS_FILE: &str = "peers.bin";
+/// A room holds four people; the extra room is for machines that changed
+/// address. Keeping every address ever seen would only slow the retries down.
+const REMEMBERED_MAX: usize = 16;
+
+pub fn load_peers(room: &OpenRoom) -> Vec<EndpointAddr> {
+    room.log
+        .read_side(PEERS_FILE)
+        .and_then(|bytes| postcard::from_bytes::<Vec<EndpointAddr>>(&bytes).ok())
+        .unwrap_or_default()
+}
+
+fn save_peers(room: &OpenRoom, peers: &[EndpointAddr]) {
+    let keep: Vec<EndpointAddr> = peers.iter().take(REMEMBERED_MAX).cloned().collect();
+    if let Ok(bytes) = postcard::to_stdvec(&keep) {
+        let _ = room.log.write_side(PEERS_FILE, &bytes);
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum SyncMsg {
     Have {
@@ -141,6 +163,15 @@ impl NetSession {
             .map(localize_addr)
             .collect();
         bootstrap.extend(scan_presence(&presence, &topic_hex, me));
+        // Everyone this room has met before. Their addresses may well be stale
+        // -- DHCP moves machines around -- but the endpoint id still lets mDNS
+        // resolve them, and a dead address just fails fast.
+        let remembered = { load_peers(&*room.lock().await) };
+        for addr in remembered {
+            if addr.id != me && !bootstrap.iter().any(|a| a.id == addr.id) {
+                bootstrap.push(localize_addr(addr));
+            }
+        }
         for addr in &bootstrap {
             memory.add_endpoint_info(addr.clone());
         }
@@ -152,7 +183,7 @@ impl NetSession {
             ));
         } else {
             let _ = events.send(NetEvent::Status(format!(
-                "found {} local peer(s), connecting…",
+                "reaching {} known peer(s)…",
                 peer_ids.len()
             )));
         }
@@ -176,6 +207,7 @@ impl NetSession {
             topic_hex,
             known.clone(),
             events,
+            room,
         ));
 
         Ok(Self {
@@ -386,6 +418,19 @@ fn scan_presence(presence: &Presence, topic: &str, me: EndpointId) -> Vec<Endpoi
     out
 }
 
+/// Ticks (of two seconds) to wait before knocking on remembered addresses
+/// again. Grows while nobody answers so an empty room does not hammer the
+/// network all day, and resets the moment somebody turns up.
+const RETRY_BACKOFF: [u32; 5] = [1, 3, 8, 15, 30];
+
+/// Next backoff step and how many ticks to wait for it. Saturates at the top
+/// so an empty room settles into one attempt a minute instead of stopping.
+fn next_backoff(step: usize) -> (usize, u32) {
+    let step = (step + 1).min(RETRY_BACKOFF.len() - 1);
+    (step, RETRY_BACKOFF[step])
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn presence_loop(
     endpoint: Endpoint,
     gossip_tx: GossipSender,
@@ -394,21 +439,24 @@ async fn presence_loop(
     topic_hex: String,
     known: Arc<Mutex<Vec<EndpointAddr>>>,
     events: mpsc::UnboundedSender<NetEvent>,
+    room: Arc<Mutex<OpenRoom>>,
 ) {
     let me = endpoint.id();
     let mut ticks = tokio::time::interval(Duration::from_secs(2));
+    let mut step = 0usize;
+    let mut countdown = 0u32;
+    let mut saved = { load_peers(&*room.lock().await).len() };
+
     loop {
         ticks.tick().await;
         let ticket = encode_ticket(&localize_addr(endpoint.addr()));
         write_presence(&presence, &topic_hex, &ticket);
-        let found = scan_presence(&presence, &topic_hex, me);
-        if found.is_empty() {
-            continue;
-        }
+
+        // Other windows on this machine, which mDNS cannot see.
         let mut added = Vec::new();
         {
             let mut known = known.lock().await;
-            for addr in found {
+            for addr in scan_presence(&presence, &topic_hex, me) {
                 memory.add_endpoint_info(addr.clone());
                 if !known.iter().any(|a| a.id == addr.id) {
                     known.push(addr.clone());
@@ -422,7 +470,37 @@ async fn presence_loop(
             let _ = events.send(NetEvent::Status(format!(
                 "found peer on this pc, connecting… ({n} known)"
             )));
+            step = 0;
+            countdown = 0;
         }
+
+        let roster = { known.lock().await.clone() };
+
+        // Remember whoever we have a route to, so the next session can come
+        // back without anyone reading a ticket out loud.
+        if roster.len() != saved {
+            saved = roster.len();
+            save_peers(&*room.lock().await, &roster);
+        }
+
+        if countdown > 0 {
+            countdown -= 1;
+            continue;
+        }
+        let targets: Vec<EndpointId> = roster.iter().map(|a| a.id).filter(|id| *id != me).collect();
+        if !targets.is_empty() {
+            for addr in &roster {
+                memory.add_endpoint_info(addr.clone());
+            }
+            // Already-connected peers are simply ignored by gossip, so this is
+            // safe to repeat.
+            let _ = gossip_tx.join_peers(targets.clone()).await;
+            let _ = events.send(NetEvent::Status(format!(
+                "reaching {} known peer(s)…",
+                targets.len()
+            )));
+        }
+        (step, countdown) = next_backoff(step);
     }
 }
 
@@ -448,6 +526,54 @@ pub fn parse_ticket(s: &str) -> Result<EndpointAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crypto::Pin;
+    use crate::store::DataDir;
+    use tempfile::TempDir;
+
+    fn any_addr() -> EndpointAddr {
+        EndpointAddr {
+            id: SecretKey::generate().public(),
+            addrs: Default::default(),
+        }
+    }
+
+    #[test]
+    fn remembered_peers_come_back_and_are_capped() {
+        let tmp = TempDir::new().unwrap();
+        let dir = DataDir::from_path(tmp.path().to_path_buf()).unwrap();
+        let pin = Pin::parse("7K2M-9QXP").unwrap();
+        let room = OpenRoom::join(&dir, pin, Some("sala")).unwrap();
+
+        assert!(load_peers(&room).is_empty(), "a fresh room knows nobody");
+
+        let seen: Vec<EndpointAddr> = (0..REMEMBERED_MAX + 9).map(|_| any_addr()).collect();
+        save_peers(&room, &seen);
+
+        let back = load_peers(&room);
+        assert_eq!(back.len(), REMEMBERED_MAX, "the list must not grow forever");
+        assert_eq!(back[0].id, seen[0].id, "the oldest known peers are kept");
+        assert_eq!(back[REMEMBERED_MAX - 1].id, seen[REMEMBERED_MAX - 1].id);
+    }
+
+    #[test]
+    fn backoff_grows_and_then_holds() {
+        let (mut step, mut wait) = next_backoff(0);
+        assert_eq!(wait, RETRY_BACKOFF[1]);
+        let mut seen = vec![wait];
+        for _ in 0..10 {
+            (step, wait) = next_backoff(step);
+            seen.push(wait);
+        }
+        assert!(
+            seen.windows(2).all(|pair| pair[1] >= pair[0]),
+            "waits must never shrink on their own, got {seen:?}"
+        );
+        assert_eq!(
+            *seen.last().unwrap(),
+            *RETRY_BACKOFF.last().unwrap(),
+            "and settle at the ceiling rather than growing without bound"
+        );
+    }
 
     #[test]
     fn presence_scan_finds_other_instance() {

@@ -13,7 +13,7 @@ local-llm
 A interface é toda em inglês, para combinar com a fachada de client de modelo.
 
 ```
-  local-llm  0.2.0
+  local-llm  0.3.0
 
   sessions
   >  gpt-oss-20b              ready
@@ -52,6 +52,7 @@ Teclas:
 | `Alt+↑` / `Alt+↓` | escolhe uma mensagem |
 | `Ctrl+R` | responde a escolhida (ou clique no `↩ reply` que aparece no hover) |
 | `Ctrl+Y` | copia a escolhida (ou clique no `⧉ copy`) |
+| `Ctrl+H` | borra a escolhida **só na sua tela** (ou clique no `▨ hide`) |
 | `Tab` | completa o nome no `/w` |
 | `F12` | disfarce: nomes viram papéis de modelo, avisos e o rascunho somem |
 | `PgUp` / `PgDn` | rola o histórico — a roda do mouse também rola |
@@ -93,6 +94,31 @@ Só o conteúdo é protegido.
 No `F12` os sussurros **somem da tela** por inteiro, e as citações também —
 elas carregariam um nome real através do disfarce.
 
+## Esconder uma mensagem
+
+`Ctrl+H`, ou o `▨ hide` que aparece ao passar o mouse, borra a mensagem:
+
+```
+  Dale  11:51
+  ██████████████████████████████
+```
+
+Nome e horário continuam à vista — você sabe que tem mensagem e de quem, sem
+ler. Isso vale **só na sua tela**: nada vai para o log nem para os outros, e
+fica guardado nesta máquina (cifrado, junto com a sala). Alternar revela de
+novo, e continua revelada até você esconder outra vez.
+
+## Voltar pra sala
+
+O app **lembra o endereço de quem já encontrou** naquela sala e volta a
+procurar sozinho ao abrir, com intervalos crescentes enquanto ninguém aparece.
+Na prática você não precisa mais pedir `/ticket` a ninguém para voltar — ele
+só serve quando o colega é novo ou quando nada mais funcionou.
+
+Os endereços ficam num arquivo cifrado com a chave da sala, dentro da pasta
+dela: saber com quem você fala e em que máquina é tão sensível quanto o
+histórico.
+
 ## Layout
 
 Suas mensagens ficam à direita, as dos outros à esquerda, como em qualquer chat:
@@ -123,8 +149,10 @@ Para conferir o layout sem abrir o app (ele precisa de terminal de verdade):
 cargo test preview_the_chat_layout -- --ignored --nocapture
 ```
 
-Colar funciona (bracketed paste) — é assim que se passa um `ticket`, que é
-grande demais para digitar.
+Colar funciona, inclusive **texto de várias linhas**, que vira uma mensagem só.
+No Windows o terminal não avisa que houve uma colagem — o crossterm só entende
+bracketed paste no Unix — então o app detecta pela rajada de eventos. Digitar
+`Enter` continua enviando normalmente.
 
 A chave é um código Crockford (`7K2M-9QXP`). Fala no corredor. **Não manda no
 Teams.** Quem lê o Teams lê a sala.
@@ -140,7 +168,7 @@ cargo build --release
 O exe sai em `target\release\local-llm.exe`. Alvo: &lt; 8 MB.
 
 ```powershell
-Compress-Archive -Path target\release\local-llm.exe -DestinationPath local-llm-0.2.0-windows-x64.zip -Force
+Compress-Archive -Path target\release\local-llm.exe -DestinationPath local-llm-0.3.0-windows-x64.zip -Force
 ```
 
 ## Como compartilhar
@@ -198,3 +226,8 @@ Fechar o terminal **não** apaga o histórico. `/forget` apaga. Sem o PIN o arqu
   `device.key` depois consegue abrir sussurros antigos daquela pessoa.
 - **Todos precisam atualizar juntos.** O formato de registro mudou na 0.2.0 e o
   ALPN foi para `local-llm/2`; versões diferentes não sincronizam.
+- Endereço guardado envelhece (DHCP troca IP). A tentativa falha rápido e o
+  identificador continua servindo pro mDNS resolver; `/ticket` segue como
+  último recurso.
+- Esconder mensagem é **visual e local**. A mensagem continua inteira no log, e
+  quem tiver a chave da sala lê normalmente.

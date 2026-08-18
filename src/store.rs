@@ -454,6 +454,26 @@ impl RoomLog {
         &self.records
     }
 
+    fn side_path(&self, name: &str) -> PathBuf {
+        self.path.with_file_name(name)
+    }
+
+    /// Encrypted scratch file next to the log, for things that belong to the
+    /// room without being part of its history: known peer addresses, local
+    /// preferences. Same key as the log, because a list of who you talk to and
+    /// where they live is as sensitive as what was said.
+    pub fn write_side(&self, name: &str, plain: &[u8]) -> Result<()> {
+        let sealed = self.key.seal(plain)?;
+        fs::write(self.side_path(name), sealed).with_context(|| format!("write {name}"))
+    }
+
+    /// Missing, corrupt or wrong-key files read as absent. None of these are
+    /// worth refusing to open a room over.
+    pub fn read_side(&self, name: &str) -> Option<Vec<u8>> {
+        let sealed = fs::read(self.side_path(name)).ok()?;
+        self.key.open(&sealed).ok()
+    }
+
     pub fn alias(&self) -> Option<String> {
         self.records.iter().rev().find_map(|r| match r {
             Record::Meta { alias } => Some(alias.clone()),
@@ -586,6 +606,36 @@ mod tests {
         assert_eq!(dir.load_nick(), "user");
         dir.save_nick("Diamante").unwrap();
         assert_eq!(dir.load_nick(), "Diamante");
+    }
+
+    #[test]
+    fn side_files_are_sealed_with_the_room_key() {
+        let tmp = TempDir::new().unwrap();
+        let dir = DataDir::from_path(tmp.path().to_path_buf()).unwrap();
+        let pin = Pin::parse("7K2M-9QXP").unwrap();
+        let log = RoomLog::open_or_create(&dir, &pin, Some("sala")).unwrap();
+
+        log.write_side("peers.bin", b"enderecos dos amigos").unwrap();
+        assert_eq!(
+            log.read_side("peers.bin").as_deref(),
+            Some(&b"enderecos dos amigos"[..])
+        );
+
+        // On disk it must not be readable.
+        let raw = fs::read(dir.room_dir(&crate::crypto::topic_id(&pin)).join("peers.bin")).unwrap();
+        assert!(!raw.windows(9).any(|w| w == b"enderecos"));
+
+        // And a different room cannot open it.
+        let other = Pin::parse("AAAA-BBBB").unwrap();
+        let elsewhere = RoomLog::open_or_create(&dir, &other, Some("outra")).unwrap();
+        fs::copy(
+            dir.room_dir(&crate::crypto::topic_id(&pin)).join("peers.bin"),
+            dir.room_dir(&crate::crypto::topic_id(&other)).join("peers.bin"),
+        )
+        .unwrap();
+        assert!(elsewhere.read_side("peers.bin").is_none());
+
+        assert!(log.read_side("nao-existe.bin").is_none());
     }
 
     #[test]

@@ -121,7 +121,41 @@ Binário: LTO fat, `opt-level = "s"`, strip, panic=abort. Alvo &lt; 8 MB. Teams 
 
 ## Onde paramos (18/ago/2026)
 
-Estado no git: branch `main`, versão **0.2.0**.
+Estado no git: branch `main`, versão **0.3.0**.
+
+### Rodada de atrito (0.3.0)
+
+Três coisas que o Pedro sentiu usando a 0.2.0 de verdade.
+
+**Colar várias linhas virava várias mensagens.** A causa vale registrar porque
+não é óbvia: o crossterm **não emite `Event::Paste` no Windows** — o parser de
+bracketed paste existe só em `sys/unix/parse.rs`. No Windows os eventos vêm da
+API de console, então cada `\n` colado chega como um `Enter` comum. O
+`EnableBracketedPaste` que está ligado não muda nada aqui. A saída foi
+**detectar a rajada**: o thread de input marca cada evento com "veio em
+rajada" (`event::poll(ZERO)` ainda acusa outro na fila, ou o anterior chegou há
+menos de 10 ms) e um `Enter` assim vira quebra de linha em vez de envio. Nada
+disso afeta digitar: dois eventos humanos nunca ficam simultâneos no buffer.
+
+**Voltar pra sala pedia `/ticket` aos colegas.** Agora cada sala guarda os
+endereços de quem já encontrou, em `peers.bin` **cifrado com a chave da sala** —
+uma lista de com-quem-você-fala e em-que-máquina é tão sensível quanto o
+histórico. Ao abrir, esses endereços entram no bootstrap; enquanto ninguém
+responde, o `presence_loop` insiste com intervalo crescente (2 s, 6 s, 16 s,
+30 s, 60 s) e reseta assim que alguém aparece. `/ticket` deixou de ser rotina.
+Endereço velho é esperado e falha rápido; o `EndpointId` guardado ainda serve
+pro mDNS resolver.
+
+**Esconder mensagem** (`Ctrl+H` ou o `▨ hide` do hover): o corpo vira blocos
+preservando a forma, com nome e horário à vista. É **local** — guardado em
+`hidden.bin` na pasta da sala, nada vai pro log nem pros peers. Alternar revela
+e mantém revelada. O borrão é construído em `build_lines`, antes de virar
+`Span`: o texto real **nunca chega ao buffer da tela**, e há teste para isso.
+
+`RoomLog::write_side`/`read_side` (`src/store.rs`) foram criados para os dois
+arquivos acima: arquivo cifrado ao lado do `log.bin`, mesma chave.
+
+56 testes, clippy limpo com `-D warnings`, binário 5,71 MB.
 
 ### Rodada de features (0.2.0)
 
@@ -170,7 +204,7 @@ através da fachada.
 
 48 testes, clippy limpo com `-D warnings`, binário 5,69 MB.
 
-Exe: `C:\GIT\projetos-paralelos\local-llm\target\release\local-llm.exe` (5,69 MB)
+Exe: `C:\GIT\projetos-paralelos\local-llm\target\release\local-llm.exe` (5,71 MB)
 
 ### Bug do log infinito (achado no teste do 0.1.4, corrigido no 0.1.5)
 
