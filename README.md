@@ -13,7 +13,7 @@ local-llm
 A interface é toda em inglês, para combinar com a fachada de client de modelo.
 
 ```
-  local-llm  0.1.4
+  local-llm  0.2.0
 
   sessions
   >  gpt-oss-20b              ready
@@ -31,7 +31,9 @@ com um Enter. `locked` pede a chave.
 | `/new gpt-oss-20b` | cria a sala, mostra a chave **no corpo do chat** e copia pro clipboard |
 | `/join 7K2M-9QXP` | entra; puxa o histórico dos peers online |
 | `/join 7K2M-9QXP <ticket>` | igual, mas disca um peer na unha (mDNS falhou) |
+| `/w Diamante <texto>` | sussurro: só ele lê. `Tab` completa o nome |
 | `/nick Diamante` | muda o nome; mensagens antigas ficam com o nome de quando foram enviadas |
+| `/notify` | `all`, `mention`, `off`, ou `30m` para calar por um tempo |
 | `/pin` | mostra a chave de novo e copia |
 | `/ticket` | endereço Iroh desta máquina, copiado pro clipboard |
 | `/peers` | **quem** está online agora, por nome |
@@ -47,6 +49,10 @@ Teclas:
 | tecla | efeito |
 |---|---|
 | `F1` | ajuda — ocupa a tela inteira, nada empurra ela pra fora |
+| `Alt+↑` / `Alt+↓` | escolhe uma mensagem |
+| `Ctrl+R` | responde a escolhida (ou clique no `↩ reply` que aparece no hover) |
+| `Ctrl+Y` | copia a escolhida (ou clique no `⧉ copy`) |
+| `Tab` | completa o nome no `/w` |
 | `F12` | disfarce: nomes viram papéis de modelo, avisos e o rascunho somem |
 | `PgUp` / `PgDn` | rola o histórico — a roda do mouse também rola |
 | `Ctrl+End` | volta pra mensagem mais nova |
@@ -59,6 +65,33 @@ Teclas:
 
 A roda do mouse rola porque o app captura o mouse. Isso tira a seleção de texto
 com arrastar — segure `Shift` para selecionar como de costume.
+
+## Responder, sussurrar, cores
+
+Passar o mouse sobre uma mensagem revela `↩ reply  ⧉ copy`; clicar age sobre
+aquela mensagem. Pelo teclado, `Alt+↑`/`Alt+↓` escolhem e `Ctrl+R`/`Ctrl+Y`
+respondem ou copiam. A resposta aparece citada:
+
+```
+  Dale  11:25
+  fechou. lembra que o banco cai as 18h
+
+                                      ┌ Dale: fechou. lembra que o banco…
+                                                          11:25  Pedro
+                                                  opa, subo 17h entao
+```
+
+Cada pessoa recebe uma **cor própria**, derivada do identificador dela — todo
+mundo vê a mesma pessoa na mesma cor, sem ninguém configurar nada.
+
+`/w <nome> <texto>` manda um sussurro. Ele é cifrado com uma chave que só
+existe entre vocês dois (X25519 derivada do `device.key`), então os outros
+guardam bytes ilegíveis mesmo tendo a chave da sala. O que **vaza** é o
+metadado: quem leu o log vê que houve um sussurro, de quem para quem e quando.
+Só o conteúdo é protegido.
+
+No `F12` os sussurros **somem da tela** por inteiro, e as citações também —
+elas carregariam um nome real através do disfarce.
 
 ## Layout
 
@@ -107,7 +140,7 @@ cargo build --release
 O exe sai em `target\release\local-llm.exe`. Alvo: &lt; 8 MB.
 
 ```powershell
-Compress-Archive -Path target\release\local-llm.exe -DestinationPath local-llm-0.1.3-windows-x64.zip -Force
+Compress-Archive -Path target\release\local-llm.exe -DestinationPath local-llm-0.2.0-windows-x64.zip -Force
 ```
 
 ## Como compartilhar
@@ -136,8 +169,13 @@ Variáveis de ambiente:
 - Transporte: [Iroh](https://www.iroh.computer) 1.0, só mDNS, sem relay.
 - Ao vivo: `iroh-gossip`. O tópico é `blake3("local-llm/v1" \|\| pin)`.
 - Histórico: log append-only no disco, ChaCha20-Poly1305, chave Argon2id do PIN.
-- Sync: ALPN `local-llm/1` — qualquer peer online serve o que o outro não tem.
-- Identidade: Ed25519 persistente em `device.key`. Assina cada mensagem.
+- Sync: ALPN `local-llm/2` — qualquer peer online serve o que o outro não tem.
+  Os registros viajam como bytes opacos, então um registro que este build não
+  entende custa aquele registro, não o lote inteiro.
+- Identidade: Ed25519 persistente em `device.key`. Assina cada mensagem. Dela
+  também sai, por derivação, a chave X25519 usada nos sussurros — publicada num
+  registro assinado, para ninguém plantar chave em nome alheio.
+- Um registro ilegível não impede a sala de abrir: ele é pulado e contado.
 
 - Chave lembrada: o PIN vai pro disco embrulhado em **DPAPI** (escopo do seu
   usuário do Windows), em `rooms\<topic>\pin.dpapi`. Outro usuário ou outra
@@ -153,4 +191,10 @@ Fechar o terminal **não** apaga o histórico. `/forget` apaga. Sem o PIN o arqu
 - Dois grupos com o mesmo PIN em redes que nunca se falam criam dois históricos.
 - Com a chave lembrada, **quem sentar na sua máquina logada lê a sala**. Esse é
   o preço de não digitar o PIN toda vez. `/lock` reverte.
-- `F12` disfarça nomes e avisos, não o texto das mensagens.
+- `F12` disfarça nomes e avisos, não o texto das mensagens — exceto sussurros,
+  que somem por completo.
+- Sussurro não tem forward secrecy: as duas pontas derivam sempre a mesma
+  chave, que é justamente o que deixa você reler o que mandou. Quem roubar um
+  `device.key` depois consegue abrir sussurros antigos daquela pessoa.
+- **Todos precisam atualizar juntos.** O formato de registro mudou na 0.2.0 e o
+  ALPN foi para `local-llm/2`; versões diferentes não sincronizam.

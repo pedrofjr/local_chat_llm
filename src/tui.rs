@@ -1,7 +1,7 @@
-use crate::crypto::{role_for, topic_id, Pin};
+use crate::crypto::{color_for, role_for, topic_id, Pin};
 use crate::net::{parse_ticket, short_id, NetEvent, NetSession, Presence};
 use crate::room::OpenRoom;
-use crate::store::{now_ts, DataDir, Record};
+use crate::store::{now_ts, DataDir, Notify, Record, Settings};
 use anyhow::Result;
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
@@ -59,10 +59,14 @@ enum Feed {
     },
     Msg {
         author: [u8; 32],
+        seq: u64,
         name: String,
         mine: bool,
         body: String,
         ts: u64,
+        reply_to: Option<([u8; 32], u64)>,
+        /// Set when this is a whisper; holds the other side of it.
+        whisper: Option<[u8; 32]>,
     },
 }
 
@@ -205,6 +209,8 @@ pub struct App {
     events_rx: Option<mpsc::UnboundedReceiver<NetEvent>>,
     peers: Vec<EndpointId>,
     names: HashMap<[u8; 32], String>,
+    /// Where each message sits in `feed`, so a reply can find what it answers.
+    by_key: HashMap<([u8; 32], u64), usize>,
     ticket: Option<String>,
     feed: Vec<Feed>,
     /// How many log records are already mirrored into `feed`. The transcript
@@ -221,12 +227,24 @@ pub struct App {
     mask_stash: String,
     offset: UtcOffset,
     last_bell: Option<Instant>,
+    settings: Settings,
+    /// Laid-out transcript, rebuilt only when something that affects it moves.
+    rendered: Option<Rendered>,
+    /// Where the transcript was painted last frame, so a mouse row can be
+    /// turned back into a message.
+    chat_area: Rect,
+    /// Message under the pointer, and the one picked with the keyboard.
+    hover: Option<usize>,
+    picked: Option<usize>,
+    /// Message the next thing you send will answer.
+    replying: Option<([u8; 32], u64)>,
 }
 
 impl App {
     pub fn new() -> Result<Self> {
         let dir = DataDir::open()?;
         let nick = dir.load_nick();
+        let settings = dir.load_settings();
         let mut app = Self {
             dir,
             screen: Screen::Home,
@@ -239,6 +257,7 @@ impl App {
             events_rx: None,
             peers: Vec::new(),
             names: HashMap::new(),
+            by_key: HashMap::new(),
             ticket: None,
             feed: Vec::new(),
             consumed: 0,
@@ -253,6 +272,12 @@ impl App {
             mask_stash: String::new(),
             offset: UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC),
             last_bell: None,
+            settings,
+            rendered: None,
+            chat_area: Rect::default(),
+            hover: None,
+            picked: None,
+            replying: None,
         };
         app.refresh_sessions();
         Ok(app)
@@ -294,7 +319,12 @@ impl App {
         self.ticket = None;
         self.room = None;
         self.feed.clear();
+        self.by_key.clear();
         self.consumed = 0;
+        self.rendered = None;
+        self.hover = None;
+        self.picked = None;
+        self.replying = None;
         self.unread = 0;
         self.follow = true;
         self.scroll = 0;
@@ -323,6 +353,48 @@ impl App {
             .map(|row| (row.alias.clone(), row.topic))
     }
 
+    /// Which icon, if any, sits under a click. Checked before the plain
+    /// "select this message" fallback.
+    fn action_at(&self, row: u16, column: u16) -> Option<Action> {
+        let anchor = self.rendered.as_ref()?.layout.actions.as_ref()?;
+        let line = row.checked_sub(self.chat_area.y)? as usize + self.scroll as usize;
+        if line != anchor.line {
+            return None;
+        }
+        let column = column.checked_sub(self.chat_area.x)?;
+        if anchor.reply.contains(&column) {
+            return Some(Action::Reply);
+        }
+        if anchor.copy.contains(&column) {
+            return Some(Action::Copy);
+        }
+        None
+    }
+
+    /// Which message is painted on a given screen row, if any. Blank spacer
+    /// rows belong to the message above them, so the pointer does not flicker
+    /// in the gaps.
+    fn message_at(&self, row: u16) -> Option<usize> {
+        let area = self.chat_area;
+        if row < area.y || row >= area.y.saturating_add(area.height) {
+            return None;
+        }
+        let rendered = self.rendered.as_ref()?;
+        let idx = (row - area.y) as usize + self.scroll as usize;
+        (*rendered.layout.owners.get(idx)?)
+            .filter(|i| matches!(self.feed.get(*i), Some(Feed::Msg { .. })))
+    }
+
+    /// Finds someone by the name they are using, ignoring case. Only other
+    /// people: whispering to yourself is not a thing.
+    fn resolve_nick(&self, who: &str) -> Option<[u8; 32]> {
+        let who = who.trim().to_lowercase();
+        self.names
+            .iter()
+            .find(|(id, name)| **id != self.me && name.to_lowercase() == who)
+            .map(|(id, _)| *id)
+    }
+
     fn peer_name(&self, id: &EndpointId) -> String {
         self.names
             .get(id.as_bytes())
@@ -330,9 +402,24 @@ impl App {
             .unwrap_or_else(|| short_id(id))
     }
 
+    /// Whether this batch of incoming text deserves a bell.
+    fn wants_bell(&self, text: &str) -> bool {
+        if now_ts() < self.settings.snooze_until {
+            return false;
+        }
+        match self.settings.notify {
+            Notify::Off => false,
+            Notify::All => true,
+            Notify::Mention => mentions(text, &self.nick),
+        }
+    }
+
     /// Best-effort audible ping, rate limited so a history sync that ingests
     /// fifty records does not machine-gun the terminal bell.
-    fn ring(&mut self) {
+    fn ring(&mut self, text: &str) {
+        if !self.wants_bell(text) {
+            return;
+        }
         let now = Instant::now();
         if self
             .last_bell
@@ -474,6 +561,7 @@ async fn apply_net(app: &mut App, ev: NetEvent) {
         }
         NetEvent::Record => {
             let before = app.consumed;
+            let seen = app.feed.len();
             sync_feed(app).await;
             if app.consumed > before {
                 if app.follow {
@@ -481,7 +569,21 @@ async fn apply_net(app: &mut App, ev: NetEvent) {
                 } else {
                     app.unread += app.consumed - before;
                 }
-                app.ring();
+                // Only what other people said counts towards a bell, and the
+                // text is needed to tell a mention from ordinary traffic.
+                let arrived: Vec<&str> = app.feed[seen..]
+                    .iter()
+                    .filter_map(|item| match item {
+                        Feed::Msg {
+                            body, mine: false, ..
+                        } => Some(body.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                if !arrived.is_empty() {
+                    let text = arrived.join("\n");
+                    app.ring(&text);
+                }
             }
         }
     }
@@ -502,17 +604,49 @@ async fn sync_feed(app: &mut App) {
             Record::Meta { alias } => app.feed.push(Feed::System {
                 body: format!("session {alias}"),
             }),
-            Record::Chat { author, ts, .. } | Record::ChatNamed { author, ts, .. } => {
-                let name = room.label_of(rec);
-                if let Record::ChatNamed { .. } = rec {
-                    app.names.insert(*author, name.clone());
-                }
+            // Not shown: it carries a key, not a message.
+            Record::Identity { .. } => {}
+            // Only the two ends can open it. For anybody else this simply
+            // produces nothing -- not even a hint that it happened.
+            Record::Whisper {
+                author, seq, ts, ..
+            } => {
+                let Some((name, body, them)) = room.open_whisper(rec) else {
+                    continue;
+                };
+                app.by_key.insert((*author, *seq), app.feed.len());
                 app.feed.push(Feed::Msg {
                     author: *author,
+                    seq: *seq,
+                    name,
+                    mine: room.is_mine(rec),
+                    body,
+                    ts: *ts,
+                    reply_to: None,
+                    whisper: Some(them),
+                });
+            }
+            Record::Chat { author, seq, ts, .. }
+            | Record::ChatNamed {
+                author, seq, ts, ..
+            }
+            | Record::Post {
+                author, seq, ts, ..
+            } => {
+                let name = room.label_of(rec);
+                if !matches!(rec, Record::Chat { .. }) {
+                    app.names.insert(*author, name.clone());
+                }
+                app.by_key.insert((*author, *seq), app.feed.len());
+                app.feed.push(Feed::Msg {
+                    author: *author,
+                    seq: *seq,
                     name,
                     mine: room.is_mine(rec),
                     body: rec.body().unwrap_or_default().to_string(),
                     ts: *ts,
+                    reply_to: rec.reply_to(),
+                    whisper: None,
                 });
             }
         }
@@ -582,8 +716,87 @@ async fn handle_key<B: Backend>(
     }
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum Action {
+    Reply,
+    Copy,
+}
+
+/// Points the next message at `idx`.
+fn arm_reply(app: &mut App, idx: usize) {
+    let Some(Feed::Msg {
+        author, seq, name, ..
+    }) = app.feed.get(idx)
+    else {
+        return;
+    };
+    app.replying = Some((*author, *seq));
+    app.picked = Some(idx);
+    app.status = format!("replying to {name}");
+}
+
+fn copy_message(app: &mut App, idx: usize) {
+    let Some(Feed::Msg { body, .. }) = app.feed.get(idx) else {
+        return;
+    };
+    let body = body.clone();
+    app.status = if crate::sys::copy(&body) {
+        "message copied".into()
+    } else {
+        "could not reach the clipboard".into()
+    };
+}
+
+/// Completes the name in `/w <name> ...`, so whispering is a couple of keys
+/// rather than an exact spelling.
+fn complete_nick(app: &mut App) {
+    let text = app.input.text.clone();
+    let Some((head, partial)) = text.rsplit_once(' ') else {
+        return;
+    };
+    if !matches!(head, "/w" | "/whisper") {
+        return;
+    }
+    let partial = partial.to_lowercase();
+    let hit = app
+        .names
+        .iter()
+        .filter(|(id, _)| **id != app.me)
+        .map(|(_, name)| name.clone())
+        .find(|name| name.to_lowercase().starts_with(&partial));
+    if let Some(name) = hit {
+        app.input.text = format!("{head} {name} ");
+        app.input.cursor = app.input.len();
+    }
+}
+
+/// Walks the selection through messages, skipping notices.
+fn pick_step(app: &mut App, back: bool) {
+    let messages: Vec<usize> = app
+        .feed
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| matches!(item, Feed::Msg { .. }))
+        .map(|(at, _)| at)
+        .collect();
+    let Some(last) = messages.len().checked_sub(1) else {
+        return;
+    };
+    let at = app
+        .picked
+        .and_then(|picked| messages.iter().position(|m| *m == picked));
+    // Starting fresh lands on the newest message, which is what you almost
+    // always want to answer.
+    let next = match (at, back) {
+        (None, _) => last,
+        (Some(i), true) => i.saturating_sub(1),
+        (Some(i), false) => (i + 1).min(last),
+    };
+    app.picked = Some(messages[next]);
+}
+
 fn handle_mouse(app: &mut App, ev: crossterm::event::MouseEvent) {
-    use crossterm::event::MouseEventKind;
+    use crossterm::event::{MouseButton, MouseEventKind};
     if !matches!(app.screen, Screen::Chat) {
         return;
     }
@@ -593,6 +806,24 @@ fn handle_mouse(app: &mut App, ev: crossterm::event::MouseEvent) {
             app.scroll = app.scroll.saturating_sub(3);
         }
         MouseEventKind::ScrollDown => scroll_down(app, 3),
+        // Movement tracking fires constantly; only a change of target is worth
+        // reacting to.
+        MouseEventKind::Moved => {
+            let at = app.message_at(ev.row);
+            if at != app.hover {
+                app.hover = at;
+            }
+        }
+        MouseEventKind::Down(MouseButton::Left) => {
+            let Some(idx) = app.message_at(ev.row) else {
+                return;
+            };
+            match app.action_at(ev.row, ev.column) {
+                Some(Action::Reply) => arm_reply(app, idx),
+                Some(Action::Copy) => copy_message(app, idx),
+                None => app.picked = Some(idx),
+            }
+        }
         _ => {}
     }
 }
@@ -736,15 +967,34 @@ async fn handle_chat<B: Backend>(
     term: &mut Terminal<B>,
 ) -> Result<bool> {
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
     let page = 6u16;
     match key.code {
         KeyCode::Esc => {
-            if app.input.text.is_empty() {
+            // Unwinds one step at a time: the armed reply first, then the line.
+            if app.replying.is_some() {
+                app.replying = None;
+                app.picked = None;
+                app.status = CHAT_HINT.into();
+            } else if app.picked.is_some() {
+                app.picked = None;
+            } else if app.input.text.is_empty() {
                 app.status = "/leave goes back to the session list".into();
             } else {
                 app.input.clear();
             }
         }
+        KeyCode::Tab => complete_nick(app),
+        KeyCode::Up if alt => pick_step(app, true),
+        KeyCode::Down if alt => pick_step(app, false),
+        KeyCode::Char('r') if is_shortcut(&key) => match app.picked.or(app.hover) {
+            Some(idx) => arm_reply(app, idx),
+            None => app.status = "alt+up picks a message to answer".into(),
+        },
+        KeyCode::Char('y') if is_shortcut(&key) => match app.picked.or(app.hover) {
+            Some(idx) => copy_message(app, idx),
+            None => app.status = "alt+up picks a message to copy".into(),
+        },
         KeyCode::PageUp => {
             app.follow = false;
             app.scroll = app.scroll.saturating_sub(page);
@@ -779,9 +1029,10 @@ async fn handle_chat<B: Backend>(
 
 async fn send(app: &mut App, body: String) {
     let Some(room) = app.room.clone() else { return };
+    let reply = app.replying;
     let rec = {
         let mut room = room.lock().await;
-        match room.compose(body) {
+        match room.compose(body, reply) {
             Ok(rec) => rec,
             Err(e) => {
                 app.status = format!("could not save message: {e}");
@@ -789,6 +1040,8 @@ async fn send(app: &mut App, body: String) {
             }
         }
     };
+    app.replying = None;
+    app.picked = None;
     app.follow = true;
     app.unread = 0;
     sync_feed(app).await;
@@ -940,6 +1193,8 @@ async fn handle_command<B: Backend>(
             }
         }
         "/forget" | "/delete" => return forget(app, &rest).await,
+        "/w" | "/whisper" => whisper_cmd(app, &line).await,
+        "/notify" | "/mute" => notify_cmd(app, &rest)?,
         "/diag" => diag(app).await,
         "/help" | "/?" => app.screen = Screen::Help,
         other => app.status = format!("no such command: {other} — /help"),
@@ -1036,9 +1291,15 @@ async fn start_session(app: &mut App, room: OpenRoom, bootstrap: Vec<EndpointAdd
         dir: app.dir.presence_dir(),
         instance: app.dir.instance,
     };
+    // Publish our whisper key before anything else, so peers can reach us
+    // privately as soon as they see us.
+    let announced = shared.lock().await.announce_identity().ok().flatten();
     match NetSession::start(secret, shared, tx, bootstrap, presence).await {
         Ok(net) => {
             app.ticket = Some(net.addr());
+            if let Some(rec) = &announced {
+                let _ = net.broadcast(rec).await;
+            }
             app.net = Some(net);
         }
         Err(e) => {
@@ -1212,13 +1473,18 @@ fn draw_help(f: &mut Frame, area: Rect) {
         ("/pin", "show the key again and copy it"),
         ("/ticket", "copy this window's address (when mdns fails)"),
         ("/peers", "who is online right now"),
+        ("/w <name> <text>", "whisper: only they can read it"),
         ("/nick <name>", "change the name others see"),
         ("/leave", "back to the session list"),
         ("/lock", "stop saving the key on this pc"),
         ("/forget", "delete this session from this pc"),
+        ("/notify", "all, mention, off, or 30m to mute for a while"),
         ("/diag", "why nobody is showing up"),
         ("/quit", "exit"),
         ("", ""),
+        ("alt+up / alt+down", "pick a message"),
+        ("ctrl+r", "answer the picked message (or click the icon)"),
+        ("ctrl+y", "copy it (or click the icon)"),
         ("f12", "hide names and notices instantly"),
         ("pgup / pgdn", "scroll — mouse wheel works too"),
         ("ctrl+end", "jump back to the newest message"),
@@ -1287,9 +1553,23 @@ fn draw_unlock(f: &mut Frame, area: Rect, alias: &str) {
 }
 
 fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
-    let lines = build_lines(app, area.width);
+    app.chat_area = area;
+    let key = RenderKey {
+        len: app.feed.len(),
+        width: area.width,
+        masked: app.masked,
+        hover: app.hover,
+        picked: app.picked,
+        replying: app.replying,
+    };
+    if app.rendered.as_ref().map(|r| r.key) != Some(key) {
+        let layout = build_lines(app, area.width);
+        app.rendered = Some(Rendered { key, layout });
+    }
+
     let viewport = area.height as usize;
-    let max_scroll = lines.len().saturating_sub(viewport) as u16;
+    let total = app.rendered.as_ref().map_or(0, |r| r.layout.lines.len());
+    let max_scroll = total.saturating_sub(viewport) as u16;
     app.max_scroll = max_scroll;
     if app.follow {
         app.scroll = max_scroll;
@@ -1300,7 +1580,162 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
             app.unread = 0;
         }
     }
-    f.render_widget(Paragraph::new(lines).scroll((app.scroll, 0)), area);
+
+    // Walking the selection with the keyboard has to bring it into view, or
+    // it moves somewhere you cannot see.
+    if let Some(idx) = app.picked {
+        let at = app
+            .rendered
+            .as_ref()
+            .and_then(|r| r.layout.owners.iter().position(|o| *o == Some(idx)));
+        if let Some(at) = at {
+            let at = at as u16;
+            if at < app.scroll {
+                app.scroll = at;
+                app.follow = false;
+            } else if at >= app.scroll + area.height {
+                app.scroll = at.saturating_sub(area.height.saturating_sub(1));
+                app.follow = false;
+            }
+        }
+    }
+
+    // Only the visible slice is painted, so how far back the history goes stops
+    // mattering per frame - which it now does, since pointer movement redraws.
+    let scroll = app.scroll as usize;
+    let Some(rendered) = app.rendered.as_ref() else {
+        return;
+    };
+    let buf = f.buffer_mut();
+    for (row, line) in rendered
+        .layout
+        .lines
+        .iter()
+        .skip(scroll)
+        .take(viewport)
+        .enumerate()
+    {
+        buf.set_line(area.x, area.y + row as u16, line, area.width);
+    }
+}
+
+/// True when `nick` appears in `text` as a whole word, with or without a
+/// leading @. Substring matching would make "ana" fire on "banana".
+fn mentions(text: &str, nick: &str) -> bool {
+    if nick.is_empty() {
+        return false;
+    }
+    let hay = text.to_lowercase();
+    let needle = nick.to_lowercase();
+    hay.match_indices(&needle).any(|(at, _)| {
+        let before = hay[..at].chars().next_back();
+        let after = hay[at + needle.len()..].chars().next();
+        before.is_none_or(|c| !c.is_alphanumeric()) && after.is_none_or(|c| !c.is_alphanumeric())
+    })
+}
+
+/// "30m", "2h", "45s" into seconds. A bare number is rejected on purpose, so
+/// `/notify 30` cannot silently mean half a minute.
+fn parse_snooze(raw: &str) -> Option<u64> {
+    let split = raw.find(|c: char| !c.is_ascii_digit())?;
+    let (count, unit) = raw.split_at(split);
+    let count: u64 = count.parse().ok()?;
+    let seconds = match unit {
+        "s" => 1,
+        "m" => 60,
+        "h" => 3600,
+        _ => return None,
+    };
+    Some(count * seconds)
+}
+
+fn describe_notify(settings: &Settings) -> String {
+    let left = settings.snooze_until.saturating_sub(now_ts());
+    if left > 0 {
+        return format!("muted for another {} min", left.div_ceil(60));
+    }
+    match settings.notify {
+        Notify::All => "beeps on every message".into(),
+        Notify::Mention => "beeps only when your name comes up".into(),
+        Notify::Off => "never beeps".into(),
+    }
+}
+
+/// Sends a message only one person can read. Everyone still sees that a
+/// whisper happened and to whom -- the protocol hides the words, not the fact.
+async fn whisper_cmd(app: &mut App, line: &str) {
+    let after = line
+        .split_once(char::is_whitespace)
+        .map(|(_, rest)| rest.trim_start())
+        .unwrap_or("");
+    let (who, text) = match after.split_once(char::is_whitespace) {
+        Some((who, text)) => (who, text.trim()),
+        None => (after, ""),
+    };
+    if who.is_empty() || text.is_empty() {
+        app.status = "usage: /w <name> <message>   (tab completes the name)".into();
+        return;
+    }
+    let Some(target) = app.resolve_nick(who) else {
+        app.status = format!("nobody here answers to {who} yet");
+        return;
+    };
+    let Some(room) = app.room.clone() else { return };
+    let rec = {
+        let mut room = room.lock().await;
+        match room.compose_whisper(target, text.to_string()) {
+            Ok(rec) => rec,
+            Err(e) => {
+                app.status = format!("whisper not sent: {e}");
+                return;
+            }
+        }
+    };
+    app.follow = true;
+    app.unread = 0;
+    sync_feed(app).await;
+    match &app.net {
+        Some(net) => {
+            if let Err(e) = net.broadcast(&rec).await {
+                app.status = format!("whisper saved but not delivered: {e}");
+            }
+        }
+        None => app.status = "offline - the whisper is saved, not sent".into(),
+    }
+}
+
+fn notify_cmd(app: &mut App, arg: &str) -> Result<()> {
+    let arg = arg.trim().to_lowercase();
+    if arg.is_empty() {
+        let state = describe_notify(&app.settings);
+        app.notice(format!("{state}   —   /notify all | mention | off | 30m"));
+        return Ok(());
+    }
+    match arg.as_str() {
+        "all" | "on" => {
+            app.settings.notify = Notify::All;
+            app.settings.snooze_until = 0;
+        }
+        "mention" | "mentions" => {
+            app.settings.notify = Notify::Mention;
+            app.settings.snooze_until = 0;
+        }
+        "off" | "mute" | "none" => {
+            app.settings.notify = Notify::Off;
+            app.settings.snooze_until = 0;
+        }
+        other => match parse_snooze(other) {
+            Some(seconds) => app.settings.snooze_until = now_ts() + seconds,
+            None => {
+                app.status = "usage: /notify all | mention | off | 30m".into();
+                return Ok(());
+            }
+        },
+    }
+    app.dir.save_settings(&app.settings)?;
+    let state = describe_notify(&app.settings);
+    app.notice(format!("notifications: {state}"));
+    Ok(())
 }
 
 /// Spaces needed to push `len` columns of text so it ends at column `edge`.
@@ -1308,26 +1743,129 @@ fn indent(edge: usize, len: usize) -> String {
     " ".repeat(edge.saturating_sub(len))
 }
 
-fn build_lines(app: &App, width: u16) -> Vec<Line<'static>> {
+/// A laid-out transcript: the lines to paint plus, for each line, which feed
+/// item produced it. That owner map is what lets the mouse and the keyboard
+/// point at a *message* instead of at a row of text.
+struct Rendered {
+    key: RenderKey,
+    layout: Transcript,
+}
+
+/// Where the clickable icons ended up on screen, so a mouse press can be told
+/// apart from a press anywhere else on the message.
+#[derive(Clone)]
+struct ActionAnchor {
+    line: usize,
+    reply: std::ops::Range<u16>,
+    copy: std::ops::Range<u16>,
+}
+
+struct Transcript {
+    lines: Vec<Line<'static>>,
+    owners: Vec<Option<usize>>,
+    actions: Option<ActionAnchor>,
+}
+
+/// Everything that changes the layout. While this holds still the previous
+/// layout is reused, which is what keeps pointer movement cheap.
+#[derive(Clone, Copy, PartialEq)]
+struct RenderKey {
+    len: usize,
+    width: u16,
+    masked: bool,
+    hover: Option<usize>,
+    picked: Option<usize>,
+    replying: Option<([u8; 32], u64)>,
+}
+
+/// Collects lines together with their owning feed item, so the two can never
+/// drift apart.
+struct Sink {
+    lines: Vec<Line<'static>>,
+    owners: Vec<Option<usize>>,
+    actions: Option<ActionAnchor>,
+}
+
+impl Sink {
+    fn push(&mut self, line: Line<'static>, owner: Option<usize>) {
+        self.lines.push(line);
+        self.owners.push(owner);
+    }
+
+    fn blank(&mut self, owner: Option<usize>) {
+        self.push(Line::from(""), owner);
+    }
+
+    /// Records that the icons live on the line about to be pushed.
+    fn arm(&mut self, reply_at: u16, copy_at: u16) {
+        self.actions = Some(ActionAnchor {
+            line: self.lines.len(),
+            reply: reply_at..reply_at + ACTION_WIDTH,
+            copy: copy_at..copy_at + ACTION_WIDTH,
+        });
+    }
+}
+
+/// Columns each icon occupies, for hit testing.
+const ACTION_WIDTH: u16 = 7;
+const REPLY_ICON: &str = "↩";
+const COPY_ICON: &str = "⧉";
+const QUOTE_MARK: &str = "┌";
+const WHISPER_MARK: &str = "→";
+
+fn action_spans() -> Vec<Span<'static>> {
+    vec![
+        Span::styled(
+            format!("{REPLY_ICON} reply"),
+            Style::default().fg(Color::Rgb(150, 170, 200)),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            format!("{COPY_ICON} copy"),
+            Style::default().fg(Color::Rgb(150, 170, 200)),
+        ),
+    ]
+}
+
+/// First line of a body, cut to fit a quote.
+fn one_line(body: &str, width: usize) -> String {
+    let first = body.lines().next().unwrap_or("");
+    if first.chars().count() <= width {
+        return first.to_string();
+    }
+    let mut cut: String = first.chars().take(width.saturating_sub(1)).collect();
+    cut.push('\u{2026}');
+    cut
+}
+
+fn build_lines(app: &App, width: u16) -> Transcript {
     let inner = (width as usize).saturating_sub(4);
     // Column the right-aligned text ends on, and how wide a message may get
     // before it wraps. Narrower than the full width so the two sides read as
     // two columns instead of one ragged block.
     let edge = (width as usize).saturating_sub(2);
     let bubble = if inner <= 32 { inner } else { (inner * 7) / 10 };
-    let mut out: Vec<Line> = Vec::new();
+    let mut sink = Sink {
+        lines: Vec::new(),
+        owners: Vec::new(),
+        actions: None,
+    };
     let mut last_day: Option<(i32, u8, u8)> = None;
-    // The transcript is re-laid out on every frame, so a year-old room must
-    // not make each keystroke reformat tens of thousands of lines.
+    // A year-old room must not make every keystroke reformat tens of thousands
+    // of lines.
     let skipped = app.feed.len().saturating_sub(RENDER_CAP);
     if skipped > 0 && !app.masked {
-        out.push(Line::from(Span::styled(
-            format!("  ── {skipped} older entries kept in the log, not shown"),
-            dim(),
-        )));
-        out.push(Line::from(""));
+        sink.push(
+            Line::from(Span::styled(
+                format!("  ── {skipped} older entries kept in the log, not shown"),
+                dim(),
+            )),
+            None,
+        );
+        sink.blank(None);
     }
-    for item in app.feed.iter().skip(skipped) {
+    for (offset, item) in app.feed.iter().skip(skipped).enumerate() {
+        let idx = skipped + offset;
         match item {
             Feed::Notice { body } | Feed::System { body } => {
                 // The disguise hides anything that talks about the network,
@@ -1336,9 +1874,9 @@ fn build_lines(app: &App, width: u16) -> Vec<Line<'static>> {
                     continue;
                 }
                 for piece in wrap_text(body, inner) {
-                    out.push(Line::from(Span::styled(format!("  {piece}"), dim())));
+                    sink.push(Line::from(Span::styled(format!("  {piece}"), dim())), None);
                 }
-                out.push(Line::from(""));
+                sink.blank(None);
             }
             Feed::Msg {
                 author,
@@ -1346,16 +1884,41 @@ fn build_lines(app: &App, width: u16) -> Vec<Line<'static>> {
                 mine,
                 body,
                 ts,
+                reply_to,
+                whisper,
+                ..
             } => {
+                // A whisper is the most sensitive thing on screen, so the
+                // disguise drops it entirely rather than relabelling it.
+                if whisper.is_some() && app.masked {
+                    continue;
+                }
                 let day = civil(*ts, app.offset);
                 if last_day != Some(day) && !app.masked {
-                    out.push(Line::from(Span::styled(
-                        format!("  ── {}", day_label(*ts, app.offset)),
-                        dim(),
-                    )));
-                    out.push(Line::from(""));
+                    sink.push(
+                        Line::from(Span::styled(
+                            format!("  ── {}", day_label(*ts, app.offset)),
+                            dim(),
+                        )),
+                        None,
+                    );
+                    sink.blank(None);
                 }
                 last_day = Some(day);
+                // The quoted line only makes sense once the answered message
+                // has arrived; until then say so rather than showing nothing.
+                // Quotes carry a real name, and an inference log has no such
+                // thing anyway, so the disguise drops them.
+                let quote = reply_to.filter(|_| !app.masked).map(|key| match app.by_key.get(&key) {
+                    Some(at) => match app.feed.get(*at) {
+                        Some(Feed::Msg { name, body, .. }) => {
+                            format!("{QUOTE_MARK} {name}: {}", one_line(body, bubble / 2))
+                        }
+                        _ => format!("{QUOTE_MARK} (message not here yet)"),
+                    },
+                    None => format!("{QUOTE_MARK} (message not here yet)"),
+                });
+                let armed = !app.masked && (app.hover == Some(idx) || app.picked == Some(idx));
                 let label = if app.masked {
                     if *mine {
                         "user".to_string()
@@ -1363,47 +1926,115 @@ fn build_lines(app: &App, width: u16) -> Vec<Line<'static>> {
                         role_for(author).to_string()
                     }
                 } else {
-                    name.clone()
+                    match whisper {
+                        Some(them) if *mine => {
+                            let who = app
+                                .names
+                                .get(them)
+                                .cloned()
+                                .unwrap_or_else(|| "them".into());
+                            format!("{name} {WHISPER_MARK} {who}")
+                        }
+                        Some(_) => format!("{name} {WHISPER_MARK} you"),
+                        None => name.clone(),
+                    }
                 };
+                // Everyone gets their own colour, derived from their id so all
+                // machines agree without anyone configuring anything. The
+                // disguise falls back to two neutral tones, because four
+                // distinct colours read as a conversation from across the room.
                 let head_style = Style::default()
-                    .fg(if *mine {
-                        Color::Rgb(160, 190, 220)
+                    .fg(if app.masked {
+                        if *mine {
+                            Color::Rgb(160, 190, 220)
+                        } else {
+                            Color::Rgb(180, 210, 170)
+                        }
                     } else {
-                        Color::Rgb(180, 210, 170)
+                        let (r, g, b) = color_for(author);
+                        Color::Rgb(r, g, b)
                     })
                     .add_modifier(Modifier::BOLD);
                 let body_style = Style::default().fg(Color::Rgb(220, 220, 220));
 
-                // Your own messages hug the right edge, the way every chat
-                // does it. The disguise turns that off: an inference log is
-                // flush left, and staggered text would give it away at a
-                // glance.
+                // Your own messages hug the right edge, the way every chat does
+                // it. The disguise turns that off: an inference log is flush
+                // left, and staggered text would give it away at a glance.
                 if *mine && !app.masked {
+                    if let Some(quote) = &quote {
+                        let pad = indent(edge, quote.chars().count());
+                        sink.push(Line::from(Span::styled(pad + quote, dim())), Some(idx));
+                    }
                     let stamp = clock(*ts, app.offset);
-                    let head_width = stamp.chars().count() + 2 + label.chars().count();
-                    out.push(Line::from(vec![
-                        Span::styled(indent(edge, head_width) + &stamp, dim()),
-                        Span::styled(format!("  {label}"), head_style),
-                    ]));
+                    let mut head_width = stamp.chars().count() + 2 + label.chars().count();
+                    // Icons sit to the left of a right-aligned header, so they
+                    // widen the block instead of pushing it off the edge.
+                    let icons = if armed {
+                        ACTION_WIDTH as usize * 2 + 2 + 3
+                    } else {
+                        0
+                    };
+                    head_width += icons;
+                    let lead = indent(edge, head_width);
+                    let mut head: Vec<Span> = Vec::new();
+                    let mut col = lead.chars().count() as u16;
+                    head.push(Span::raw(lead));
+                    if armed {
+                        sink.arm(col, col + ACTION_WIDTH + 2);
+                        head.extend(action_spans());
+                        head.push(Span::raw("   "));
+                        col += icons as u16;
+                    }
+                    let _ = col;
+                    head.push(Span::styled(stamp, dim()));
+                    head.push(Span::styled(format!("  {label}"), head_style));
+                    sink.push(Line::from(head), Some(idx));
                     for piece in wrap_text(body, bubble) {
                         let pad = indent(edge, piece.chars().count());
-                        out.push(Line::from(Span::styled(pad + &piece, body_style)));
+                        sink.push(
+                            Line::from(Span::styled(pad + &piece, body_style)),
+                            Some(idx),
+                        );
                     }
                 } else {
-                    let mut head = vec![Span::styled(format!("  {label}"), head_style)];
-                    if !app.masked {
-                        head.push(Span::styled(format!("  {}", clock(*ts, app.offset)), dim()));
+                    if let Some(quote) = &quote {
+                        sink.push(
+                            Line::from(Span::styled(format!("  {quote}"), dim())),
+                            Some(idx),
+                        );
                     }
-                    out.push(Line::from(head));
+                    let mut head = vec![Span::styled(format!("  {label}"), head_style)];
+                    let mut col = 2 + label.chars().count() as u16;
+                    if !app.masked {
+                        let stamp = clock(*ts, app.offset);
+                        head.push(Span::styled(format!("  {stamp}"), dim()));
+                        col += 2 + stamp.chars().count() as u16;
+                    }
+                    if armed {
+                        head.push(Span::raw("   "));
+                        col += 3;
+                        sink.arm(col, col + ACTION_WIDTH + 2);
+                        head.extend(action_spans());
+                    }
+                    sink.push(Line::from(head), Some(idx));
                     for piece in wrap_text(body, if app.masked { inner } else { bubble }) {
-                        out.push(Line::from(Span::styled(format!("  {piece}"), body_style)));
+                        sink.push(
+                            Line::from(Span::styled(format!("  {piece}"), body_style)),
+                            Some(idx),
+                        );
                     }
                 }
-                out.push(Line::from(""));
+                // The trailing blank belongs to the message above it, so the
+                // pointer does not flicker in the gap between messages.
+                sink.blank(Some(idx));
             }
         }
     }
-    out
+    Transcript {
+        lines: sink.lines,
+        owners: sink.owners,
+        actions: sink.actions,
+    }
 }
 
 fn draw_status(f: &mut Frame, area: Rect, app: &App) {
@@ -1411,6 +2042,17 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
         MASKED_STATUS.to_string()
     } else if matches!(app.screen, Screen::Help) {
         "any key closes this".to_string()
+    } else if let Some(key) = app.replying {
+        let who = app
+            .by_key
+            .get(&key)
+            .and_then(|at| app.feed.get(*at))
+            .and_then(|item| match item {
+                Feed::Msg { name, .. } => Some(name.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| "someone".into());
+        format!("replying to {who}   esc cancels")
     } else if app.unread > 0 {
         format!("{}   ▼ {} new below   ctrl+end", app.status, app.unread)
     } else if matches!(app.screen, Screen::Chat) && !app.follow {
@@ -1590,8 +2232,363 @@ mod tests {
         assert!(h.app.dir.list_sessions().unwrap().is_empty());
     }
 
+    /// Appends somebody else's message the same way sync_feed would, index
+    /// included -- without the index a quote cannot find what it answers.
+    fn push_peer(app: &mut App, author: [u8; 32], seq: u64, name: &str, body: &str) {
+        app.by_key.insert((author, seq), app.feed.len());
+        app.feed.push(from_peer(author, seq, name, body));
+    }
+
+    /// A message from somebody else, for tests that only care about layout.
+    fn from_peer(author: [u8; 32], seq: u64, name: &str, body: &str) -> Feed {
+        Feed::Msg {
+            author,
+            seq,
+            name: name.into(),
+            mine: false,
+            body: body.into(),
+            ts: now_ts(),
+            reply_to: None,
+            whisper: None,
+        }
+    }
+
     fn flatten(line: &Line) -> String {
         line.spans.iter().map(|s| s.content.to_string()).collect()
+    }
+
+    /// Colour of the bold author span on the line carrying `needle`.
+    fn head_colour(lines: &[Line], needle: &str) -> Option<Color> {
+        lines
+            .iter()
+            .find(|line| flatten(line).contains(needle))?
+            .spans
+            .iter()
+            .find(|span| span.content.contains(needle))
+            .and_then(|span| span.style.fg)
+    }
+
+    #[test]
+    fn a_mention_is_a_whole_word() {
+        assert!(mentions("opa @Pedro, olha isso", "Pedro"));
+        assert!(mentions("pedro viu?", "Pedro"), "case should not matter");
+        assert!(mentions("fala ana", "Ana"));
+        assert!(
+            !mentions("comprei bananas hoje", "ana"),
+            "substrings must not fire the bell"
+        );
+        assert!(!mentions("nada a ver", "Pedro"));
+        assert!(!mentions("qualquer texto", ""));
+    }
+
+    #[test]
+    fn a_snooze_needs_a_unit() {
+        assert_eq!(parse_snooze("30m"), Some(1800));
+        assert_eq!(parse_snooze("2h"), Some(7200));
+        assert_eq!(parse_snooze("45s"), Some(45));
+        // A bare number must not silently mean seconds or minutes.
+        assert_eq!(parse_snooze("30"), None);
+        assert_eq!(parse_snooze("m"), None);
+        assert_eq!(parse_snooze("30d"), None);
+    }
+
+    #[tokio::test]
+    async fn notification_modes_decide_when_the_bell_rings() {
+        let mut h = Harness::new();
+        h.cmd("/nick Pedro").await;
+        assert!(
+            h.app.wants_bell("qualquer coisa"),
+            "every message by default"
+        );
+
+        h.cmd("/notify mention").await;
+        assert!(!h.app.wants_bell("assunto que nao me cita"));
+        assert!(h.app.wants_bell("@Pedro consegue olhar?"));
+
+        h.cmd("/notify off").await;
+        assert!(!h.app.wants_bell("@Pedro consegue olhar?"));
+
+        h.cmd("/notify all").await;
+        h.cmd("/notify 30m").await;
+        assert!(h.app.settings.snooze_until > now_ts());
+        assert!(!h.app.wants_bell("qualquer coisa"), "snoozed");
+
+        // Preference survives a restart.
+        assert_eq!(h.app.dir.load_settings().notify, Notify::All);
+        assert!(h.app.dir.load_settings().snooze_until > now_ts());
+    }
+
+    fn mouse(app: &mut App, kind: crossterm::event::MouseEventKind, row: u16, column: u16) {
+        handle_mouse(
+            app,
+            crossterm::event::MouseEvent {
+                kind,
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+    }
+
+    /// First screen row that carries a message.
+    fn first_message_row(app: &App) -> u16 {
+        let area = app.chat_area;
+        (area.y..area.y + area.height)
+            .find(|row| app.message_at(*row).is_some())
+            .expect("a message should be on screen")
+    }
+
+    #[tokio::test]
+    async fn a_reply_carries_a_pointer_and_shows_a_quote() {
+        let mut h = Harness::new();
+        h.cmd("/new gpt-oss-20b").await;
+        send(&mut h.app, "deploy quinta".into()).await;
+        let answered = match h.app.feed.last().unwrap() {
+            Feed::Msg { author, seq, .. } => (*author, *seq),
+            _ => panic!("expected a message"),
+        };
+
+        h.app.replying = Some(answered);
+        send(&mut h.app, "confirmo".into()).await;
+        assert_eq!(h.app.replying, None, "sending must disarm the reply");
+
+        match h.app.feed.last().unwrap() {
+            Feed::Msg { reply_to, .. } => assert_eq!(*reply_to, Some(answered)),
+            _ => panic!("expected a message"),
+        }
+
+        let quoted = build_lines(&h.app, 80)
+            .lines
+            .iter()
+            .map(flatten)
+            .any(|text| text.contains(QUOTE_MARK) && text.contains("deploy quinta"));
+        assert!(quoted, "the answered message should be quoted above the reply");
+    }
+
+    #[tokio::test]
+    async fn answering_something_we_never_received_says_so() {
+        let mut h = Harness::new();
+        h.cmd("/new gpt-oss-20b").await;
+        h.app.replying = Some(([42u8; 32], 99));
+        send(&mut h.app, "resposta orfa".into()).await;
+
+        let text: String = build_lines(&h.app, 80).lines.iter().map(flatten).collect();
+        assert!(
+            text.contains("not here yet"),
+            "a dangling quote must be admitted, not silently dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_keyboard_picks_a_message_and_answers_it() {
+        let mut h = Harness::new();
+        h.cmd("/new gpt-oss-20b").await;
+        send(&mut h.app, "primeira".into()).await;
+        send(&mut h.app, "segunda".into()).await;
+        h.painted();
+
+        // Nothing picked yet: the first step lands on the newest message.
+        let alt_up = KeyEvent::new(KeyCode::Up, KeyModifiers::ALT);
+        handle_key(&mut h.app, alt_up, &mut h.term).await.unwrap();
+        match &h.app.feed[h.app.picked.expect("something picked")] {
+            Feed::Msg { body, .. } => assert_eq!(body, "segunda"),
+            _ => panic!("expected a message"),
+        }
+
+        handle_key(&mut h.app, alt_up, &mut h.term).await.unwrap();
+        match &h.app.feed[h.app.picked.unwrap()] {
+            Feed::Msg { body, .. } => assert_eq!(body, "primeira"),
+            _ => panic!("expected a message"),
+        }
+
+        let ctrl_r = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL);
+        handle_key(&mut h.app, ctrl_r, &mut h.term).await.unwrap();
+        assert!(h.app.replying.is_some(), "ctrl+r should arm the reply");
+        assert!(h.painted().contains("replying to"));
+
+        // Esc unwinds the reply before touching anything else.
+        h.press(KeyCode::Esc).await;
+        assert!(h.app.replying.is_none());
+    }
+
+    #[tokio::test]
+    async fn hovering_reveals_icons_and_clicking_one_acts_on_that_message() {
+        use crossterm::event::{MouseButton, MouseEventKind};
+
+        let mut h = Harness::new();
+        h.cmd("/new gpt-oss-20b").await;
+        push_peer(&mut h.app, [9u8; 32], 7, "Dale", "e a daily?");
+        h.painted();
+
+        let plain = h.painted();
+        assert!(!plain.contains("reply"), "icons stay hidden until hovered");
+
+        let row = first_message_row(&h.app);
+        mouse(&mut h.app, MouseEventKind::Moved, row, 4);
+        assert_eq!(h.app.hover, h.app.message_at(row));
+        let shown = h.painted();
+        assert!(shown.contains("reply") && shown.contains("copy"));
+
+        let anchor = h
+            .app
+            .rendered
+            .as_ref()
+            .unwrap()
+            .layout
+            .actions
+            .clone()
+            .expect("icons should be anchored");
+        let icon_row = h.app.chat_area.y + (anchor.line as u16 - h.app.scroll);
+
+        mouse(
+            &mut h.app,
+            MouseEventKind::Down(MouseButton::Left),
+            icon_row,
+            anchor.reply.start,
+        );
+        assert_eq!(
+            h.app.replying,
+            Some(([9u8; 32], 7)),
+            "clicking the reply icon should arm that very message"
+        );
+
+        // A click away from the icons just picks the message.
+        h.app.replying = None;
+        mouse(&mut h.app, MouseEventKind::Down(MouseButton::Left), row, 4);
+        assert!(h.app.replying.is_none());
+        assert!(h.app.picked.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_whisper_is_labelled_for_its_two_ends_and_gone_in_the_disguise() {
+        let mut h = Harness::new();
+        h.cmd("/nick Pedro").await;
+        h.cmd("/new gpt-oss-20b").await;
+        h.app.names.insert([9u8; 32], "Dale".into());
+
+        let me = h.app.me;
+        h.app.feed.push(Feed::Msg {
+            author: [9u8; 32],
+            seq: 1,
+            name: "Dale".into(),
+            mine: false,
+            body: "isso fica entre nos".into(),
+            ts: now_ts(),
+            reply_to: None,
+            whisper: Some(me),
+        });
+
+        let shown: String = build_lines(&h.app, 80).lines.iter().map(flatten).collect();
+        assert!(shown.contains("isso fica entre nos"));
+        assert!(
+            shown.contains(&format!("Dale {WHISPER_MARK} you")),
+            "a whisper should say who it is between"
+        );
+
+        h.app.masked = true;
+        let hidden: String = build_lines(&h.app, 80).lines.iter().map(flatten).collect();
+        assert!(
+            !hidden.contains("isso fica entre nos"),
+            "the disguise must drop whispers entirely, not relabel them"
+        );
+    }
+
+    #[tokio::test]
+    async fn whispering_needs_a_name_it_knows() {
+        let mut h = Harness::new();
+        h.cmd("/new gpt-oss-20b").await;
+
+        h.cmd("/w").await;
+        assert!(h.app.status.contains("usage"));
+
+        h.cmd("/w Fulano").await;
+        assert!(h.app.status.contains("usage"), "a name alone is not a message");
+
+        h.cmd("/w Fulano oi tudo bem").await;
+        assert!(
+            h.app.status.contains("Fulano"),
+            "an unknown name should be named back, got {:?}",
+            h.app.status
+        );
+
+        // Tab completion fills the name in from who has spoken.
+        h.app.names.insert([9u8; 32], "Diamante".into());
+        h.app.input.clear();
+        h.app.input.insert_str("/w dia");
+        h.press(KeyCode::Tab).await;
+        assert_eq!(h.app.input.text, "/w Diamante ");
+    }
+
+    #[tokio::test]
+    async fn a_screen_row_maps_back_to_its_message() {
+        let mut h = Harness::new();
+        h.cmd("/new gpt-oss-20b").await;
+        for i in 0..5 {
+            send(&mut h.app, format!("mensagem {i}")).await;
+        }
+        h.painted();
+
+        let area = h.app.chat_area;
+        let mut walked: Vec<usize> = Vec::new();
+        for row in area.y..area.y + area.height {
+            if let Some(idx) = h.app.message_at(row) {
+                if walked.last() != Some(&idx) {
+                    walked.push(idx);
+                }
+            }
+        }
+
+        assert!(walked.len() >= 2, "several messages should be on screen");
+        assert!(
+            walked.windows(2).all(|pair| pair[0] < pair[1]),
+            "rows must map to messages in order, got {walked:?}"
+        );
+        match &h.app.feed[*walked.last().unwrap()] {
+            Feed::Msg { body, .. } => assert_eq!(body, "mensagem 4"),
+            _ => panic!("newest row should own a chat message"),
+        }
+
+        // The header row is above the transcript and owns no message.
+        assert_eq!(h.app.message_at(0), None);
+        assert_eq!(h.app.message_at(area.y + area.height), None);
+    }
+
+    #[tokio::test]
+    async fn hovering_only_lands_on_messages_not_on_notices() {
+        let mut h = Harness::new();
+        h.cmd("/new gpt-oss-20b").await;
+        h.painted();
+
+        // Fresh room: the transcript is all notices (the key, the warning).
+        let area = h.app.chat_area;
+        let any = (area.y..area.y + area.height).any(|row| h.app.message_at(row).is_some());
+        assert!(!any, "notices must not be hoverable targets");
+    }
+
+    #[tokio::test]
+    async fn people_get_different_colours_until_the_disguise_is_on() {
+        let mut h = Harness::new();
+        h.cmd("/nick Pedro").await;
+        h.cmd("/new gpt-oss-20b").await;
+        push_peer(&mut h.app, [9u8; 32], 1, "Dale", "primeiro");
+        push_peer(&mut h.app, [200u8; 32], 2, "Ana", "segundo");
+
+        let lines = build_lines(&h.app, 80).lines;
+        let dale = head_colour(&lines, "Dale").expect("Dale on screen");
+        let ana = head_colour(&lines, "Ana").expect("Ana on screen");
+        assert_ne!(dale, ana, "two people must not share a colour");
+
+        // Same person, same colour, with no configuration anywhere.
+        let again = build_lines(&h.app, 100).lines;
+        assert_eq!(head_colour(&again, "Dale"), Some(dale));
+
+        h.app.masked = true;
+        let masked = build_lines(&h.app, 80).lines;
+        assert_eq!(
+            head_colour(&masked, "gpt-oss"),
+            head_colour(&masked, "assistant"),
+            "the disguise must flatten everyone onto one neutral tone"
+        );
     }
 
     #[tokio::test]
@@ -1600,15 +2597,9 @@ mod tests {
         h.cmd("/nick Pedro").await;
         h.cmd("/new gpt-oss-20b").await;
         send(&mut h.app, "vou sair mais cedo".into()).await;
-        h.app.feed.push(Feed::Msg {
-            author: [9u8; 32],
-            name: "Dale".into(),
-            mine: false,
-            body: "beleza".into(),
-            ts: now_ts(),
-        });
+        push_peer(&mut h.app, [9u8; 32], 3, "Dale", "beleza");
 
-        let lines = build_lines(&h.app, 80);
+        let lines = build_lines(&h.app, 80).lines;
         let find = |needle: &str| {
             lines
                 .iter()
@@ -1635,7 +2626,7 @@ mod tests {
         send(&mut h.app, "vou sair mais cedo".into()).await;
 
         h.app.masked = true;
-        let lines = build_lines(&h.app, 80);
+        let lines = build_lines(&h.app, 80).lines;
         let mine = lines
             .iter()
             .map(flatten)
@@ -1643,6 +2634,21 @@ mod tests {
             .unwrap();
         // Staggered text would read as a chat, not as an inference log.
         assert_eq!(mine, "  vou sair mais cedo");
+
+        // A quoted line would carry a real name straight through the disguise.
+        h.app.masked = false;
+        let answered = match h.app.feed.last().unwrap() {
+            Feed::Msg { author, seq, .. } => (*author, *seq),
+            _ => panic!("expected a message"),
+        };
+        h.app.replying = Some(answered);
+        send(&mut h.app, "e ai".into()).await;
+        h.app.masked = true;
+        let masked: String = build_lines(&h.app, 80).lines.iter().map(flatten).collect();
+        assert!(
+            !masked.contains(QUOTE_MARK) && !masked.contains("Pedro"),
+            "quotes must not leak a name into the disguise"
+        );
     }
 
     /// Not an assertion — a way to eyeball the chat layout without launching
@@ -1654,27 +2660,38 @@ mod tests {
         let mut h = Harness::new();
         h.cmd("/nick Pedro").await;
         h.cmd("/new gpt-oss-20b").await;
-        h.app.feed.push(Feed::Msg {
-            author: [9u8; 32],
-            name: "Dale".into(),
-            mine: false,
-            body: "e a daily, o que ficou?".into(),
-            ts: now_ts(),
-        });
+        push_peer(&mut h.app, [9u8; 32], 4, "Dale", "e a daily, o que ficou?");
         send(&mut h.app, "deploy quinta, eu pego o script".into()).await;
+        push_peer(&mut h.app, [9u8; 32], 5, "Dale", "fechou. lembra que o banco de homologacao cai as 18h, entao tem que subir antes disso");
+        // Answer Dale, so the quote line shows up in the preview.
+        let answered = match h.app.feed.last().unwrap() {
+            Feed::Msg { author, seq, .. } => (*author, *seq),
+            _ => panic!("expected a message"),
+        };
+        h.app.replying = Some(answered);
+        send(&mut h.app, "opa, boa. subo 17h entao".into()).await;
+        h.app.names.insert([9u8; 32], "Dale".into());
+        let me = h.app.me;
         h.app.feed.push(Feed::Msg {
             author: [9u8; 32],
+            seq: 9,
             name: "Dale".into(),
             mine: false,
-            body: "fechou. lembra que o banco de homologacao cai as 18h, entao tem que subir antes disso".into(),
+            body: "psiu, o cliente ligou reclamando de novo".into(),
             ts: now_ts(),
+            reply_to: None,
+            whisper: Some(me),
         });
-        send(&mut h.app, "opa, boa".into()).await;
         h.app.input.insert_str("ate amanha");
+        h.painted();
 
-        for masked in [false, true] {
-            h.app.masked = masked;
-            let label = if masked { "F12 (disguise)" } else { "normal" };
+        for label in ["normal", "hover", "F12 (disguise)"] {
+            h.app.masked = label.starts_with("F12");
+            h.app.hover = if label == "hover" {
+                h.app.message_at(first_message_row(&h.app))
+            } else {
+                None
+            };
             println!("\n=== {label} ===");
             let painted: Vec<char> = h.painted().chars().collect();
             for row in painted.chunks(80) {

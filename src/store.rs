@@ -29,6 +29,36 @@ pub enum Record {
         body: String,
         sig: Vec<u8>,
     },
+    /// Published once per person: the X25519 public key used to seal whispers
+    /// to them, signed by their Ed25519 identity so nobody can plant a key in
+    /// someone else's name.
+    Identity {
+        author: [u8; 32],
+        x_pub: [u8; 32],
+        sig: Vec<u8>,
+    },
+    /// What the app writes from v2 on: a chat message that may answer another.
+    Post {
+        author: [u8; 32],
+        seq: u64,
+        ts: u64,
+        name: String,
+        body: String,
+        reply_to: Option<([u8; 32], u64)>,
+        sig: Vec<u8>,
+    },
+    /// A message only `to` can read. Everyone else keeps the bytes and can
+    /// still check the signature, but the plaintext is not theirs to have.
+    Whisper {
+        author: [u8; 32],
+        seq: u64,
+        ts: u64,
+        to: [u8; 32],
+        /// Sealed with the pair key; the nonce rides in the first bytes, the
+        /// same way the room log stores its own records.
+        ct: Vec<u8>,
+        sig: Vec<u8>,
+    },
 }
 
 impl Record {
@@ -40,26 +70,44 @@ impl Record {
         postcard::from_bytes(bytes).context("decode record")
     }
 
+    /// Whispers share the author's sequence with ordinary messages on
+    /// purpose: one counter per person means the two can never collide.
     pub fn chat_key(&self) -> Option<([u8; 32], u64)> {
         match self {
-            Record::Chat { author, seq, .. } | Record::ChatNamed { author, seq, .. } => {
-                Some((*author, *seq))
-            }
-            Record::Meta { .. } => None,
+            Record::Chat { author, seq, .. }
+            | Record::ChatNamed { author, seq, .. }
+            | Record::Post { author, seq, .. }
+            | Record::Whisper { author, seq, .. } => Some((*author, *seq)),
+            Record::Meta { .. } | Record::Identity { .. } => None,
         }
     }
 
+    /// Readable text. A whisper has none until it is opened with the right
+    /// key, so it deliberately answers `None` here.
     pub fn body(&self) -> Option<&str> {
         match self {
-            Record::Chat { body, .. } | Record::ChatNamed { body, .. } => Some(body),
-            Record::Meta { .. } => None,
+            Record::Chat { body, .. }
+            | Record::ChatNamed { body, .. }
+            | Record::Post { body, .. } => Some(body),
+            Record::Meta { .. } | Record::Identity { .. } | Record::Whisper { .. } => None,
         }
     }
 
     pub fn author(&self) -> Option<&[u8; 32]> {
         match self {
-            Record::Chat { author, .. } | Record::ChatNamed { author, .. } => Some(author),
+            Record::Chat { author, .. }
+            | Record::ChatNamed { author, .. }
+            | Record::Post { author, .. }
+            | Record::Whisper { author, .. }
+            | Record::Identity { author, .. } => Some(author),
             Record::Meta { .. } => None,
+        }
+    }
+
+    pub fn reply_to(&self) -> Option<([u8; 32], u64)> {
+        match self {
+            Record::Post { reply_to, .. } => *reply_to,
+            _ => None,
         }
     }
 }
@@ -67,6 +115,24 @@ impl Record {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct IndexFile {
     sessions: Vec<IndexEntry>,
+}
+
+/// When the terminal bell is allowed to ring.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Notify {
+    #[default]
+    All,
+    Mention,
+    Off,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct Settings {
+    pub notify: Notify,
+    /// Unix seconds until which the bell stays quiet regardless of `notify`.
+    pub snooze_until: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -150,6 +216,24 @@ impl DataDir {
 
     pub fn device_key_path(&self) -> PathBuf {
         self.root.join("device.key")
+    }
+
+    fn settings_path(&self) -> PathBuf {
+        self.root.join("settings.toml")
+    }
+
+    /// Missing or unreadable settings fall back to the defaults rather than
+    /// failing: a corrupt preferences file must never keep the chat shut.
+    pub fn load_settings(&self) -> Settings {
+        fs::read_to_string(self.settings_path())
+            .ok()
+            .and_then(|text| toml::from_str(&text).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn save_settings(&self, settings: &Settings) -> Result<()> {
+        let text = toml::to_string_pretty(settings).context("encode settings")?;
+        fs::write(self.settings_path(), text).context("save settings")
     }
 
     fn pin_path(&self, topic: &[u8; 32]) -> PathBuf {
@@ -291,6 +375,7 @@ impl RoomLog {
             seen: BTreeMap::new(),
         };
         let mut duplicates = 0usize;
+        let mut unreadable = 0usize;
         let mut offset = MAGIC.len();
         while offset + 4 <= bytes.len() {
             let len = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
@@ -300,7 +385,12 @@ impl RoomLog {
             }
             let plain = log.key.open(&bytes[offset..offset + len])?;
             offset += len;
-            let rec = Record::decode(&plain)?;
+            // A record this build cannot parse is almost certainly one a newer
+            // build wrote. Skipping beats refusing to open the room.
+            let Ok(rec) = Record::decode(&plain) else {
+                unreadable += 1;
+                continue;
+            };
             if log.is_new(&rec) {
                 log.remember(rec);
             } else {
@@ -308,8 +398,10 @@ impl RoomLog {
             }
         }
         // Older builds appended a fresh Meta on every sync round, so logs in
-        // the wild carry thousands of copies. Rewrite them once, on open.
-        if duplicates > 0 {
+        // the wild carry thousands of copies. Rewrite them once, on open --
+        // but never while holding records we could not parse, since rewriting
+        // from memory would silently delete them.
+        if duplicates > 0 && unreadable == 0 {
             log.rewrite().context("compact log")?;
         }
         Ok(log)
@@ -327,6 +419,10 @@ impl RoomLog {
                     .records
                     .iter()
                     .any(|held| matches!(held, Record::Meta { alias: had } if had == alias)),
+                // One published key per person; the sync resends it forever.
+                Record::Identity { author, .. } => !self.records.iter().any(
+                    |held| matches!(held, Record::Identity { author: had, .. } if had == author),
+                ),
                 _ => true,
             },
         }
@@ -386,7 +482,7 @@ impl RoomLog {
         self.records
             .iter()
             .filter(|rec| match rec.chat_key() {
-                None => matches!(rec, Record::Meta { .. }),
+                None => matches!(rec, Record::Meta { .. } | Record::Identity { .. }),
                 Some((author, seq)) => their.get(&author).is_none_or(|h| seq > *h),
             })
             .cloned()

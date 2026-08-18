@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Context, Result};
+use curve25519_dalek::montgomery::MontgomeryPoint;
 use argon2::{Algorithm, Argon2, Params, Version};
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
@@ -115,6 +116,57 @@ impl RoomKey {
     }
 }
 
+/// Stable per-person colours. Picked to stay apart from each other on a dark
+/// terminal, and to keep clear of the red that reads as an error. Derived from
+/// the author id, so every machine shows the same person in the same colour
+/// without anyone configuring anything.
+const PALETTE: &[(u8, u8, u8)] = &[
+    (130, 180, 235),
+    (150, 205, 150),
+    (225, 190, 120),
+    (200, 160, 225),
+    (130, 210, 205),
+    (230, 170, 150),
+    (190, 205, 130),
+    (215, 165, 195),
+];
+
+pub fn color_for(author: &[u8; 32]) -> (u8, u8, u8) {
+    let n = u32::from_le_bytes(author[0..4].try_into().unwrap()) as usize;
+    PALETTE[n % PALETTE.len()]
+}
+
+/// X25519 secret for whispers, derived from the Ed25519 device seed. Deriving
+/// rather than reusing the signing key keeps signing and encryption apart, and
+/// costs nothing: both come out of the same file.
+pub fn whisper_secret(device_seed: &[u8; 32]) -> [u8; 32] {
+    blake3::derive_key("local-llm x25519 v1", device_seed)
+}
+
+pub fn whisper_public(secret: &[u8; 32]) -> [u8; 32] {
+    MontgomeryPoint::mul_base_clamped(*secret).0
+}
+
+/// Symmetric key shared by exactly two people. Both sides derive the same one,
+/// which is what lets the sender reread what they sent. The price is no
+/// forward secrecy: someone who later steals a device key can open old
+/// whispers it took part in.
+pub fn whisper_key(
+    secret: &[u8; 32],
+    their_x_pub: &[u8; 32],
+    me: &[u8; 32],
+    them: &[u8; 32],
+) -> RoomKey {
+    let shared = MontgomeryPoint(*their_x_pub).mul_clamped(*secret);
+    // Canonical order, so both ends mix the identities the same way round.
+    let (first, second) = if me <= them { (me, them) } else { (them, me) };
+    let mut material = Vec::with_capacity(96);
+    material.extend_from_slice(&shared.0);
+    material.extend_from_slice(first);
+    material.extend_from_slice(second);
+    RoomKey(blake3::derive_key("local-llm whisper v1", &material))
+}
+
 pub fn role_for(author: &[u8; 32]) -> &'static str {
     const ROLES: &[&str] = &[
         "assistant",
@@ -149,6 +201,27 @@ mod tests {
         let a = Pin::parse("7K2M-9QXP").unwrap();
         let b = Pin::parse("7k2m9qxp").unwrap();
         assert_eq!(topic_id(&a), topic_id(&b));
+    }
+
+    #[test]
+    fn whisper_keys_agree_between_the_two_sides() {
+        let a_seed = [7u8; 32];
+        let b_seed = [9u8; 32];
+        let (a_id, b_id) = ([1u8; 32], [2u8; 32]);
+        let (a_sec, b_sec) = (whisper_secret(&a_seed), whisper_secret(&b_seed));
+        let (a_pub, b_pub) = (whisper_public(&a_sec), whisper_public(&b_sec));
+
+        let from_a = whisper_key(&a_sec, &b_pub, &a_id, &b_id);
+        let from_b = whisper_key(&b_sec, &a_pub, &b_id, &a_id);
+        let sealed = from_a.seal(b"segredo").unwrap();
+        assert_eq!(from_b.open(&sealed).unwrap(), b"segredo");
+        // And the sender can reread it, which is the point of a static ECDH.
+        assert_eq!(from_a.open(&sealed).unwrap(), b"segredo");
+
+        // A third person with the room key gets nothing.
+        let c_sec = whisper_secret(&[3u8; 32]);
+        let outsider = whisper_key(&c_sec, &b_pub, &[3u8; 32], &b_id);
+        assert!(outsider.open(&sealed).is_err());
     }
 
     #[test]

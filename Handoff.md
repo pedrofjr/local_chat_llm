@@ -121,9 +121,56 @@ Binário: LTO fat, `opt-level = "s"`, strip, panic=abort. Alvo &lt; 8 MB. Teams 
 
 ## Onde paramos (18/ago/2026)
 
-Estado no git: branch `main`, versão **0.1.5**.
+Estado no git: branch `main`, versão **0.2.0**.
 
-Exe: `C:\GIT\projetos-paralelos\local-llm\target\release\local-llm.exe` (5,64 MB)
+### Rodada de features (0.2.0)
+
+Cinco pedidos do Pedro, com quatro decisões travadas por ele: sussurro
+**privado de verdade** (não só escondido na tela), reply por **mouse e
+teclado**, copiar **só a mensagem inteira** (sem toggle da captura de mouse) e
+cores **só automáticas** (sem ajuste manual).
+
+- **Responder**: `Alt+setas` escolhem uma mensagem, `Ctrl+R` responde; passar o
+  mouse revela `↩ reply  ⧉ copy` e clicar age naquela mensagem. A citação sai
+  truncada acima, do lado em que a mensagem estiver.
+- **Sussurro** (`/w <nome> <texto>`, `Tab` completa): X25519 derivada do
+  `device.key` por `blake3::derive_key`, publicada num `Record::Identity`
+  assinado; ECDH estático dos dois lados (é o que deixa o remetente reler o que
+  mandou, ao custo de não ter forward secrecy); corpo selado com
+  ChaCha20-Poly1305. Terceiros guardam o registro, validam a assinatura e não
+  leem nada. **Metadado vaza** — quem lê o log vê que houve sussurro e entre
+  quem.
+- **Copiar**: `Ctrl+Y` ou clique no ícone. Seleção parcial com o mouse continua
+  indisponível (decisão do Pedro), porque a captura de mouse segue ligada.
+- **Cores**: derivadas do identificador (`color_for` em `crypto.rs`), então
+  todas as máquinas concordam sem configuração.
+- **Notificações**: `/notify all|mention|off|30m`, guardado em `settings.toml`.
+  No modo `mention` o casamento é por palavra inteira — "ana" não dispara em
+  "banana".
+
+**Protocolo v2, com quebra assumida:** três variantes novas (`Identity`,
+`Post`, `Whisper`) acrescentadas ao fim do enum; `Post` substitui `ChatNamed`
+como o que o app escreve. `SYNC_ALPN` foi para `local-llm/2` para que versões
+diferentes falhem limpo. O `topic` **não** mudou — ele nomeia a pasta em disco e
+serve de entropia do DPAPI. Os quatro precisam atualizar juntos.
+
+Robustez que veio junto: registro ilegível é pulado no `load` (e a compactação
+é suprimida nesse caso, senão reescrever de memória apagaria o que não
+entendemos); `SyncMsg::Give` carrega bytes opacos; e `signed_bytes` passou a
+usar framing por comprimento — o `sign_payload` antigo concatenava os campos,
+então `("ab","c")` e `("abc","")` assinavam os mesmos bytes.
+
+Desempenho: o transcript virou cache (`Rendered`/`RenderKey`) e só as linhas
+visíveis são pintadas via `set_line`, porque com rastreamento de mouse ligado o
+redesenho passou a acontecer a cada movimento.
+
+O disfarce `F12` foi reforçado: além de nomes e avisos, agora some com
+**sussurros inteiros** e com as **citações** — a citação carregava um nome real
+através da fachada.
+
+48 testes, clippy limpo com `-D warnings`, binário 5,69 MB.
+
+Exe: `C:\GIT\projetos-paralelos\local-llm\target\release\local-llm.exe` (5,69 MB)
 
 ### Bug do log infinito (achado no teste do 0.1.4, corrigido no 0.1.5)
 

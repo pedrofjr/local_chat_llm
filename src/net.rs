@@ -21,12 +21,20 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, Mutex};
 
-pub const SYNC_ALPN: &[u8] = b"local-llm/1";
+/// Bumped for the v2 record set. An older build simply fails to connect,
+/// which is a better failure than half-understood traffic.
+pub const SYNC_ALPN: &[u8] = b"local-llm/2";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum SyncMsg {
-    Have { heads: BTreeMap<[u8; 32], u64> },
-    Give { records: Vec<Record> },
+    Have {
+        heads: BTreeMap<[u8; 32], u64>,
+    },
+    /// Records travel as opaque bytes so one entry this build cannot parse
+    /// costs that entry, not the whole batch.
+    Give {
+        records: Vec<Vec<u8>>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -59,9 +67,13 @@ impl ProtocolHandler for SyncState {
         let req = recv.read_to_end(64 * 1024).await.map_err(io_err)?;
         let msg: SyncMsg = postcard::from_bytes(&req).map_err(io_err)?;
         if let SyncMsg::Have { heads } = msg {
-            let missing = {
+            let missing: Vec<Vec<u8>> = {
                 let room = self.room.lock().await;
-                room.log.missing_for(&heads)
+                room.log
+                    .missing_for(&heads)
+                    .iter()
+                    .filter_map(|rec| rec.encode().ok())
+                    .collect()
             };
             let reply = postcard::to_stdvec(&SyncMsg::Give { records: missing }).map_err(io_err)?;
             send.write_all(&reply).await.map_err(io_err)?;
@@ -255,7 +267,10 @@ async fn sync_loop(
                         if let Ok(buf) = recv.read_to_end(2 * 1024 * 1024).await {
                             if let Ok(SyncMsg::Give { records }) = postcard::from_bytes(&buf) {
                                 let mut room = room.lock().await;
-                                for rec in records {
+                                for raw in records {
+                                    let Ok(rec) = Record::decode(&raw) else {
+                                        continue;
+                                    };
                                     if let Ok(true) = room.ingest(rec) {
                                         let _ = events.send(NetEvent::Record);
                                     }
