@@ -33,15 +33,34 @@ const PEERS_FILE: &str = "peers.bin";
 /// address. Keeping every address ever seen would only slow the retries down.
 const REMEMBERED_MAX: usize = 16;
 
+/// Drops loopback candidates. Kept on disk they are worse than useless: a
+/// remembered "127.0.0.1" belongs to whichever machine reads the file next.
+/// Windows on this machine find each other through the presence file instead.
+/// An entry left with no address at all is still worth keeping -- the endpoint
+/// id alone is enough for mDNS to resolve it on the next run.
+fn strip_loopback(mut addr: EndpointAddr) -> EndpointAddr {
+    addr.addrs
+        .retain(|a| !matches!(a, TransportAddr::Ip(sa) if sa.ip().is_loopback()));
+    addr
+}
+
 pub fn load_peers(room: &OpenRoom) -> Vec<EndpointAddr> {
     room.log
         .read_side(PEERS_FILE)
         .and_then(|bytes| postcard::from_bytes::<Vec<EndpointAddr>>(&bytes).ok())
         .unwrap_or_default()
+        .into_iter()
+        .map(strip_loopback)
+        .collect()
 }
 
 fn save_peers(room: &OpenRoom, peers: &[EndpointAddr]) {
-    let keep: Vec<EndpointAddr> = peers.iter().take(REMEMBERED_MAX).cloned().collect();
+    let keep: Vec<EndpointAddr> = peers
+        .iter()
+        .cloned()
+        .map(strip_loopback)
+        .take(REMEMBERED_MAX)
+        .collect();
     if let Ok(bytes) = postcard::to_stdvec(&keep) {
         let _ = room.log.write_side(PEERS_FILE, &bytes);
     }
@@ -135,7 +154,6 @@ impl Mesh {
         if addr.id == self.me {
             return false;
         }
-        let addr = localize_addr(addr);
         self.memory.add_endpoint_info(addr.clone());
         {
             let mut known = self.known.lock().await;
@@ -149,7 +167,7 @@ impl Mesh {
     }
 
     async fn beat(&self, room: &Arc<Mutex<OpenRoom>>) {
-        let Ok(addr) = postcard::to_stdvec(&localize_addr(self.endpoint.addr())) else {
+        let Ok(addr) = postcard::to_stdvec(&with_loopback(self.endpoint.addr())) else {
             return;
         };
         let rec = { room.lock().await.compose_presence(addr) };
@@ -213,7 +231,7 @@ impl NetSession {
 
         wait_for_addrs(&endpoint).await;
         let me = endpoint.id();
-        let my_addr = localize_addr(endpoint.addr());
+        let my_addr = with_loopback(endpoint.addr());
         let ticket = encode_ticket(&my_addr);
         let _ = events.send(NetEvent::Ticket(ticket.clone()));
         write_presence(&presence, &topic_hex, &ticket);
@@ -221,7 +239,6 @@ impl NetSession {
         let mut bootstrap: Vec<EndpointAddr> = bootstrap
             .into_iter()
             .filter(|a| a.id != me)
-            .map(localize_addr)
             .collect();
         bootstrap.extend(scan_presence(&presence, &topic_hex, me));
         // Everyone this room has met before. Their addresses may well be stale
@@ -230,7 +247,7 @@ impl NetSession {
         let remembered = { load_peers(&*room.lock().await) };
         for addr in remembered {
             if addr.id != me && !bootstrap.iter().any(|a| a.id == addr.id) {
-                bootstrap.push(localize_addr(addr));
+                bootstrap.push(addr);
             }
         }
         for addr in &bootstrap {
@@ -420,7 +437,15 @@ async fn wait_for_addrs(endpoint: &Endpoint) {
     }
 }
 
-fn localize_addr(mut addr: EndpointAddr) -> EndpointAddr {
+/// Adds a loopback candidate to **our own** address, which is the only way
+/// two windows on one machine can reach each other -- mDNS does not see
+/// processes on the same host.
+///
+/// Never apply this to somebody else's address. "127.0.0.1:their-port" points
+/// at *this* machine, so a peer learned that way is dialled locally: with a
+/// second window open the connection lands on the wrong process, and with none
+/// it just burns a fast-looking candidate that goes nowhere.
+fn with_loopback(mut addr: EndpointAddr) -> EndpointAddr {
     let mut extra = Vec::new();
     for item in &addr.addrs {
         if let TransportAddr::Ip(sa) = item {
@@ -505,7 +530,8 @@ fn scan_presence(presence: &Presence, topic: &str, me: EndpointId) -> Vec<Endpoi
         }
         if let Ok(addr) = parse_ticket(ticket) {
             if addr.id != me {
-                out.push(localize_addr(addr));
+                // Written by another window on this machine, loopback included.
+                out.push(addr);
             }
         }
     }
@@ -543,7 +569,7 @@ async fn presence_loop(
 
     loop {
         ticks.tick().await;
-        let ticket = encode_ticket(&localize_addr(endpoint.addr()));
+        let ticket = encode_ticket(&with_loopback(endpoint.addr()));
         write_presence(&presence, &topic_hex, &ticket);
 
         // Other windows on this machine, which mDNS cannot see.
@@ -621,6 +647,59 @@ mod tests {
             id: SecretKey::generate().public(),
             addrs: Default::default(),
         }
+    }
+
+    fn addr_with(ips: &[&str]) -> EndpointAddr {
+        EndpointAddr {
+            id: SecretKey::generate().public(),
+            addrs: ips
+                .iter()
+                .map(|ip| TransportAddr::Ip(ip.parse().unwrap()))
+                .collect(),
+        }
+    }
+
+    fn has_loopback(addr: &EndpointAddr) -> bool {
+        addr.addrs
+            .iter()
+            .any(|a| matches!(a, TransportAddr::Ip(sa) if sa.ip().is_loopback()))
+    }
+
+    #[test]
+    fn our_own_address_advertises_loopback_but_a_peers_never_does() {
+        // Our own: the loopback candidate is the only way a second window on
+        // this machine can reach us, since mDNS does not see same-host peers.
+        let mine = with_loopback(addr_with(&["192.168.1.10:4200"]));
+        assert!(has_loopback(&mine), "our own address needs the local route");
+
+        // Somebody else's: "127.0.0.1:their-port" resolves to *this* machine.
+        // Remembering it sends the next session dialling itself, which is how
+        // a room ends up with everyone talking only to their own other window.
+        let theirs = strip_loopback(addr_with(&["192.168.1.20:4100", "127.0.0.1:4100"]));
+        assert!(!has_loopback(&theirs), "a peer must not be dialled locally");
+        assert_eq!(theirs.addrs.len(), 1, "the real address survives");
+    }
+
+    #[test]
+    fn remembering_a_peer_scrubs_the_local_route() {
+        let tmp = TempDir::new().unwrap();
+        let dir = DataDir::from_path(tmp.path().to_path_buf()).unwrap();
+        let pin = Pin::parse("KKKK-MMMM").unwrap();
+        let room = OpenRoom::join(&dir, pin, Some("sala")).unwrap();
+
+        save_peers(&room, &[addr_with(&["10.0.0.5:5000", "127.0.0.1:5000"])]);
+        let back = load_peers(&room);
+        assert_eq!(back.len(), 1);
+        assert!(
+            !has_loopback(&back[0]),
+            "a stale local route must not survive to the next session"
+        );
+
+        // A peer we only know by id is still worth keeping: mDNS can resolve it.
+        save_peers(&room, &[addr_with(&["127.0.0.1:5000"])]);
+        let only_id = load_peers(&room);
+        assert_eq!(only_id.len(), 1);
+        assert!(only_id[0].addrs.is_empty());
     }
 
     #[test]

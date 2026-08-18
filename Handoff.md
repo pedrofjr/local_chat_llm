@@ -121,7 +121,33 @@ Binário: LTO fat, `opt-level = "s"`, strip, panic=abort. Alvo &lt; 8 MB. Teams 
 
 ## Onde paramos (18/ago/2026)
 
-Estado no git: branch `main`, versão **0.3.3**.
+Estado no git: branch `main`, versão **0.3.4**.
+
+### O bug que derrubou a sala (0.3.4)
+
+Dois erros meus, achados depois que o grupo não conseguiu mais se juntar.
+
+**1. `localize_addr` aplicada a endereço alheio.** Ela injeta
+`127.0.0.1:<porta>` num `EndpointAddr`. Para o **nosso** endereço isso é
+necessário (duas janelas na mesma máquina não se enxergam por mDNS). Aplicada
+ao endereço **de outra pessoa**, grava que ela mora nesta máquina — e o iroh
+disca localmente, caindo na outra janela local ou em nada. Existia desde a
+0.1.3 afetando só o ticket; a 0.3.1 espalhou para todo endereço aprendido por
+presença **e passou a salvar em disco** no `peers.bin`. Daí o relato "esse sala
+eu entro só comigo".
+
+Agora a função se chama `with_loopback` e só toca no endereço próprio;
+`strip_loopback` limpa o que vem de fora e o que já ficou salvo. Um peer que
+sobra só com o id continua guardado: o mDNS resolve pelo id.
+
+**2. `Presence` inserida no meio do enum `Record`.** postcard numera variantes
+por posição, então `Whisper` mudou de 5 para 6 — quebrando sussurros e a
+leitura de logs entre versões. Movida para o fim, com
+`record_tags_never_move` travando os sete números.
+
+Decisão do Pedro nesta altura: **legado condenado**. Compatibilidade de rede
+com versões anteriores deixa de ser requisito; a leitura de `Chat`/`ChatNamed`
+antigos fica só para não jogar fora o histórico já gravado.
 
 ### Achados de uso real (0.3.3)
 

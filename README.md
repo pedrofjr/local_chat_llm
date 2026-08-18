@@ -13,7 +13,7 @@ local-llm
 A interface é toda em inglês, para combinar com a fachada de client de modelo.
 
 ```
-  local-llm  0.3.3
+  local-llm  0.3.4
 
   sessions
   >  gpt-oss-20b              ready
@@ -185,7 +185,7 @@ cargo build --release
 O exe sai em `target\release\local-llm.exe`. Alvo: &lt; 8 MB.
 
 ```powershell
-Compress-Archive -Path target\release\local-llm.exe -DestinationPath local-llm-0.3.3-windows-x64.zip -Force
+Compress-Archive -Path target\release\local-llm.exe -DestinationPath local-llm-0.3.4-windows-x64.zip -Force
 ```
 
 ## Como compartilhar

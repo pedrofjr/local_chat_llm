@@ -47,17 +47,6 @@ pub enum Record {
         reply_to: Option<([u8; 32], u64)>,
         sig: Vec<u8>,
     },
-    /// Heartbeat: "I am in this room, right now". Never written to the log --
-    /// being present is a live fact, not history. Carries the sender's own
-    /// address, which is what lets someone who only knows A end up connected
-    /// to B as well: A's heartbeat introduces everyone it can reach.
-    Presence {
-        author: [u8; 32],
-        name: String,
-        addr: Vec<u8>,
-        ts: u64,
-        sig: Vec<u8>,
-    },
     /// A message only `to` can read. Everyone else keeps the bytes and can
     /// still check the signature, but the plaintext is not theirs to have.
     Whisper {
@@ -68,6 +57,17 @@ pub enum Record {
         /// Sealed with the pair key; the nonce rides in the first bytes, the
         /// same way the room log stores its own records.
         ct: Vec<u8>,
+        sig: Vec<u8>,
+    },
+    /// Heartbeat: "I am in this room, right now". Never written to the log --
+    /// being present is a live fact, not history. Carries the sender's own
+    /// address, which is what lets someone who only knows A end up connected
+    /// to B as well: A's heartbeat introduces everyone it can reach.
+    Presence {
+        author: [u8; 32],
+        name: String,
+        addr: Vec<u8>,
+        ts: u64,
         sig: Vec<u8>,
     },
 }
@@ -637,6 +637,79 @@ mod tests {
         assert_eq!(dir.load_nick(), "user");
         dir.save_nick("Diamante").unwrap();
         assert_eq!(dir.load_nick(), "Diamante");
+    }
+
+    #[test]
+    fn record_tags_never_move() {
+        // postcard numbers enum variants by position, so slipping a new one
+        // into the middle silently renames every record written after it --
+        // which is exactly what happened when Presence landed before Whisper.
+        // New variants go at the end, and this test is the tripwire.
+        let tag = |rec: Record| rec.encode().unwrap()[0];
+        let blank = || Vec::new();
+        assert_eq!(tag(Record::Meta { alias: String::new() }), 0);
+        assert_eq!(
+            tag(Record::Chat {
+                author: [0; 32],
+                seq: 0,
+                ts: 0,
+                body: String::new(),
+                sig: blank(),
+            }),
+            1
+        );
+        assert_eq!(
+            tag(Record::ChatNamed {
+                author: [0; 32],
+                seq: 0,
+                ts: 0,
+                name: String::new(),
+                body: String::new(),
+                sig: blank(),
+            }),
+            2
+        );
+        assert_eq!(
+            tag(Record::Identity {
+                author: [0; 32],
+                x_pub: [0; 32],
+                sig: blank(),
+            }),
+            3
+        );
+        assert_eq!(
+            tag(Record::Post {
+                author: [0; 32],
+                seq: 0,
+                ts: 0,
+                name: String::new(),
+                body: String::new(),
+                reply_to: None,
+                sig: blank(),
+            }),
+            4
+        );
+        assert_eq!(
+            tag(Record::Whisper {
+                author: [0; 32],
+                seq: 0,
+                ts: 0,
+                to: [0; 32],
+                ct: blank(),
+                sig: blank(),
+            }),
+            5
+        );
+        assert_eq!(
+            tag(Record::Presence {
+                author: [0; 32],
+                name: String::new(),
+                addr: blank(),
+                ts: 0,
+                sig: blank(),
+            }),
+            6
+        );
     }
 
     #[test]
