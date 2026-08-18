@@ -34,9 +34,12 @@ const MASKED_STATUS: &str = "loaded · q4_k_m · 8192 ctx · 24 layers on gpu";
 /// A peer that has not said anything for this long is treated as gone. Three
 /// missed heartbeats, so a hiccup does not make people blink in and out.
 const PRESENCE_TTL: Duration = Duration::from_secs(20);
-/// Two key events closer together than this came from the terminal, not from
-/// fingers. Pasting is the only thing that produces it.
-const PASTE_GAP: Duration = Duration::from_millis(10);
+/// Two keystrokes closer together than this came from the terminal, not from
+/// fingers: the fastest typists in the world leave some 60 ms between keys.
+const PASTE_GAP: Duration = Duration::from_millis(5);
+/// How many back-to-back keystrokes it takes before we believe it is a paste.
+/// One close pair proves nothing; a run of them cannot be typed.
+const BURST_RUN: usize = 3;
 /// Most recent transcript entries laid out per frame. Older ones stay in the
 /// log and come back when the room is reopened.
 const RENDER_CAP: usize = 800;
@@ -508,29 +511,60 @@ pub async fn run() -> Result<()> {
 /// is the one thing that tells them apart: either another event is already
 /// queued, or the previous one landed microseconds ago. Human typing does
 /// neither.
+/// Counts how many events arrived back-to-back. A paste is a long run of
+/// them; typing never is.
+#[derive(Default)]
+struct Burst {
+    previous: Option<Instant>,
+    run: usize,
+}
+
+impl Burst {
+    /// Records an event and answers whether we are inside a paste. Deliberately
+    /// needs a *run* of close events: asking "is another event queued?" was the
+    /// first attempt and it misfired on every keystroke, because Windows queues
+    /// a release right behind each press.
+    fn observe(&mut self, now: Instant) -> bool {
+        let close = self
+            .previous
+            .is_some_and(|at| now.duration_since(at) < PASTE_GAP);
+        self.run = if close { self.run + 1 } else { 0 };
+        self.previous = Some(now);
+        self.run >= BURST_RUN
+    }
+
+    fn idle(&mut self) {
+        self.previous = None;
+        self.run = 0;
+    }
+}
+
 fn spawn_input_thread() -> mpsc::UnboundedReceiver<(Event, bool)> {
     let (tx, rx) = mpsc::unbounded_channel();
     std::thread::Builder::new()
         .name("input".into())
         .spawn(move || {
-            let mut previous: Option<Instant> = None;
+            let mut burst = Burst::default();
             loop {
                 match event::poll(Duration::from_millis(200)) {
                     Ok(true) => match event::read() {
                         Ok(ev) => {
-                            let queued = matches!(event::poll(Duration::ZERO), Ok(true));
-                            let now = Instant::now();
-                            let hurried =
-                                previous.is_some_and(|at| now.duration_since(at) < PASTE_GAP);
-                            previous = Some(now);
-                            if tx.send((ev, queued || hurried)).is_err() {
+                            // Every key on Windows arrives twice, pressed and
+                            // released. Timing both would make each keystroke
+                            // look like two events a microsecond apart.
+                            if matches!(&ev, Event::Key(key) if key.kind == KeyEventKind::Release)
+                            {
+                                continue;
+                            }
+                            let pasting = burst.observe(Instant::now());
+                            if tx.send((ev, pasting)).is_err() {
                                 break;
                             }
                         }
                         Err(_) => break,
                     },
                     Ok(false) => {
-                        previous = None;
+                        burst.idle();
                         if tx.is_closed() {
                             break;
                         }
@@ -1147,7 +1181,9 @@ async fn handle_chat<B: Backend>(
         KeyCode::Up => app.input.recall_prev(),
         KeyCode::Down => app.input.recall_next(),
         // A newline inside a paste belongs to the message, not to the send key.
-        KeyCode::Enter if shift || pasting => app.input.insert('\n'),
+        KeyCode::Enter if shift || (pasting && app.settings.paste_detect) => {
+            app.input.insert('\n')
+        }
         KeyCode::Enter => {
             let line = app.input.take();
             let trimmed = line.trim();
@@ -1331,6 +1367,7 @@ async fn handle_command<B: Backend>(
         }
         "/forget" | "/delete" => return forget(app, &rest).await,
         "/w" | "/whisper" => whisper_cmd(app, &line).await,
+        "/paste" => paste_cmd(app, &rest)?,
         "/notify" | "/mute" => notify_cmd(app, &rest)?,
         "/diag" => diag(app).await,
         "/help" | "/?" => app.screen = Screen::Help,
@@ -1608,50 +1645,63 @@ fn draw_home(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(Paragraph::new(lines), area);
 }
 
+/// Two columns, because the list outgrew a single screen and help that needs
+/// scrolling is help nobody reads.
 fn draw_help(f: &mut Frame, area: Rect) {
-    const ROWS: &[(&str, &str)] = &[
-        ("", ""),
-        ("/new <name>", "create a session and show its key"),
-        ("/join <key> [ticket]", "join one someone gave you"),
-        ("/pin", "show the key again and copy it"),
-        ("/ticket", "copy this window's address (when mdns fails)"),
-        ("/peers", "who is online right now"),
-        ("/w <name> <text>", "whisper: only they can read it"),
-        ("/nick <name>", "change the name others see"),
-        ("/leave", "back to the session list"),
-        ("/lock", "stop saving the key on this pc"),
-        ("/forget", "delete this session from this pc"),
-        ("/notify", "all, mention, off, or 30m to mute for a while"),
-        ("/diag", "why nobody is showing up"),
+    const COMMANDS: &[(&str, &str)] = &[
+        ("/new <name>", "create a session"),
+        ("/join <key>", "join with a key"),
+        ("/pin", "show + copy the key"),
+        ("/ticket", "copy your address"),
+        ("/peers", "who is here now"),
+        ("/w <name> <text>", "private message"),
+        ("/nick <name>", "change your name"),
+        ("/notify", "bell settings"),
+        ("/paste", "on or off"),
+        ("/leave", "back to the list"),
+        ("/lock", "forget the key here"),
+        ("/forget", "delete it here"),
+        ("/diag", "why nobody shows up"),
         ("/quit", "exit"),
-        ("", ""),
-        ("alt+up / alt+down", "pick a message"),
-        ("ctrl+r", "answer the picked message (or click the icon)"),
-        ("ctrl+y", "copy it (or click the icon)"),
-        ("ctrl+h", "blur it on this screen only (or click the icon)"),
-        ("f12", "hide names and notices instantly"),
-        ("pgup / pgdn", "scroll — mouse wheel works too"),
-        ("ctrl+end", "jump back to the newest message"),
-        ("up / down", "reuse what you typed before"),
-        ("shift+enter", "newline inside one message"),
-        ("del", "on the session list: delete the selected one"),
-        ("esc", "clear the line · close this help"),
     ];
-    let lines: Vec<Line> = ROWS
-        .iter()
-        .map(|(key, what)| {
-            if key.is_empty() {
-                return Line::from("");
-            }
-            Line::from(vec![
-                Span::styled(
-                    format!("  {key:<22}"),
-                    Style::default().fg(Color::Rgb(200, 220, 190)),
-                ),
-                Span::styled(what.to_string(), dim()),
-            ])
-        })
-        .collect();
+    const KEYS: &[(&str, &str)] = &[
+        ("f1", "this screen"),
+        ("f12", "hide names"),
+        ("alt+up / alt+down", "pick a message"),
+        ("ctrl+r", "answer it"),
+        ("ctrl+y", "copy it"),
+        ("ctrl+h", "blur it here"),
+        ("pgup / pgdn", "scroll (wheel too)"),
+        ("ctrl+end", "jump to the newest"),
+        ("up / down", "reuse what you typed"),
+        ("shift+enter", "newline"),
+        ("tab", "complete a name"),
+        ("del", "on the list: delete"),
+        ("esc", "clear the line"),
+    ];
+
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(area);
+    draw_help_column(f, columns[0], "commands", COMMANDS);
+    draw_help_column(f, columns[1], "keys", KEYS);
+}
+
+fn draw_help_column(f: &mut Frame, area: Rect, title: &str, rows: &[(&str, &str)]) {
+    let mut lines = vec![
+        Line::from(Span::styled(format!("  {title}"), dim())),
+        Line::from(""),
+    ];
+    for (key, what) in rows {
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("  {key:<18}"),
+                Style::default().fg(Color::Rgb(200, 220, 190)),
+            ),
+            Span::styled((*what).to_string(), dim()),
+        ]));
+    }
     f.render_widget(Paragraph::new(lines), area);
 }
 
@@ -1847,6 +1897,30 @@ async fn whisper_cmd(app: &mut App, line: &str) {
         }
         None => app.status = "offline - the whisper is saved, not sent".into(),
     }
+}
+
+/// Escape hatch for the paste heuristic. With it off, Enter always sends and
+/// a pasted block goes back to arriving one message per line -- which some
+/// people will prefer to any amount of guessing.
+fn paste_cmd(app: &mut App, arg: &str) -> Result<()> {
+    match arg.trim().to_lowercase().as_str() {
+        "" => {}
+        "on" => app.settings.paste_detect = true,
+        "off" => app.settings.paste_detect = false,
+        _ => {
+            app.status = "usage: /paste on | off".into();
+            return Ok(());
+        }
+    }
+    if !arg.trim().is_empty() {
+        app.dir.save_settings(&app.settings)?;
+    }
+    app.notice(if app.settings.paste_detect {
+        "pasted line breaks stay inside one message. shift+enter also breaks a line."
+    } else {
+        "enter always sends. a pasted block arrives one message per line."
+    });
+    Ok(())
 }
 
 fn notify_cmd(app: &mut App, arg: &str) -> Result<()> {
@@ -2696,6 +2770,32 @@ mod tests {
         assert_eq!(h.transcript().matches("Dale left").count(), 1);
     }
 
+    #[test]
+    fn typing_is_never_mistaken_for_a_paste() {
+        let start = Instant::now();
+        let mut burst = Burst::default();
+
+        // Someone typing quickly: 40 ms between keys, well under a record
+        // holder's pace and still nowhere near a paste.
+        for step in 1..=20 {
+            let typed = burst.observe(start + Duration::from_millis(step * 40));
+            assert!(!typed, "keystroke {step} was taken for a paste");
+        }
+
+        // A paste: the terminal dumps everything at once.
+        let dump = start + Duration::from_secs(1);
+        assert!(!burst.observe(dump), "one close pair proves nothing");
+        assert!(!burst.observe(dump + Duration::from_micros(200)));
+        assert!(!burst.observe(dump + Duration::from_micros(400)));
+        assert!(
+            burst.observe(dump + Duration::from_micros(600)),
+            "a run of instant events is a paste"
+        );
+
+        // And typing again right after settles it back down.
+        assert!(!burst.observe(dump + Duration::from_millis(500)));
+    }
+
     #[tokio::test]
     async fn a_pasted_block_arrives_as_one_message() {
         let mut h = Harness::new();
@@ -3110,6 +3210,21 @@ mod tests {
             for row in painted.chunks(80) {
                 println!("|{}|", row.iter().collect::<String>().trim_end());
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_whole_help_fits_a_small_terminal() {
+        // The Harness paints 80x24, about the smallest window anyone uses.
+        // Help that needs scrolling is help nobody reads, so every entry has
+        // to be on screen at once.
+        let mut h = Harness::new();
+        h.cmd("/help").await;
+        let painted = h.painted();
+        for probe in [
+            "/new", "/join", "/w ", "/paste", "/quit", "f1", "f12", "ctrl+h", "shift+enter", "esc",
+        ] {
+            assert!(painted.contains(probe), "{probe} fell off the help screen");
         }
     }
 

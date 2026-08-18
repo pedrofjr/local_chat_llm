@@ -13,7 +13,7 @@ local-llm
 A interface é toda em inglês, para combinar com a fachada de client de modelo.
 
 ```
-  local-llm  0.3.1
+  local-llm  0.3.2
 
   sessions
   >  gpt-oss-20b              ready
@@ -162,8 +162,13 @@ cargo test preview_the_chat_layout -- --ignored --nocapture
 
 Colar funciona, inclusive **texto de várias linhas**, que vira uma mensagem só.
 No Windows o terminal não avisa que houve uma colagem — o crossterm só entende
-bracketed paste no Unix — então o app detecta pela rajada de eventos. Digitar
-`Enter` continua enviando normalmente.
+bracketed paste no Unix — então o app detecta pela rajada de eventos: só trata
+a quebra como parte da mensagem depois de uma sequência de teclas separadas por
+menos de 5 ms, coisa que ninguém digita. `Enter` digitado sempre envia.
+
+Se ainda assim atrapalhar, `/paste off` desliga a detecção: `Enter` passa a
+sempre enviar e um bloco colado volta a virar uma mensagem por linha.
+`Shift+Enter` quebra linha em qualquer um dos modos.
 
 A chave é um código Crockford (`7K2M-9QXP`). Fala no corredor. **Não manda no
 Teams.** Quem lê o Teams lê a sala.
@@ -179,7 +184,7 @@ cargo build --release
 O exe sai em `target\release\local-llm.exe`. Alvo: &lt; 8 MB.
 
 ```powershell
-Compress-Archive -Path target\release\local-llm.exe -DestinationPath local-llm-0.3.1-windows-x64.zip -Force
+Compress-Archive -Path target\release\local-llm.exe -DestinationPath local-llm-0.3.2-windows-x64.zip -Force
 ```
 
 ## Como compartilhar

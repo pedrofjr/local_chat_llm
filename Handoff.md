@@ -121,7 +121,23 @@ Binário: LTO fat, `opt-level = "s"`, strip, panic=abort. Alvo &lt; 8 MB. Teams 
 
 ## Onde paramos (18/ago/2026)
 
-Estado no git: branch `main`, versão **0.3.1**.
+Estado no git: branch `main`, versão **0.3.2**.
+
+### Detecção de colagem, segunda tentativa (0.3.1)
+
+A primeira heurística perguntava "há outro evento na fila?" e disparava em
+**toda** digitação: no Windows cada tecla enfileira um *press* e um *release*,
+então ao ler o press o release já estava lá. O Pedro digitava, dava espaço e o
+Enter virava quebra de linha.
+
+Agora o thread descarta *release* antes de medir qualquer coisa, e exige uma
+**sequência** de teclas com menos de 5 ms entre si (`BURST_RUN = 3`) — um par
+próximo não prova nada, uma sequência não se digita. `Burst::observe` é uma
+função pura, com teste alimentando instantes sintéticos de digitação rápida
+(40 ms) e de colagem (microssegundos).
+
+Como isso é heurística e roda na máquina dos outros, existe válvula de escape:
+`/paste off` (guardado em `settings.toml`) faz o Enter sempre enviar.
 
 ### Presença de verdade (0.3.1)
 

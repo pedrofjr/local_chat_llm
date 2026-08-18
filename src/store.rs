@@ -142,12 +142,25 @@ pub enum Notify {
     Off,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     pub notify: Notify,
     /// Unix seconds until which the bell stays quiet regardless of `notify`.
     pub snooze_until: u64,
+    /// Whether a newline arriving in a burst is treated as part of a pasted
+    /// message. Turn it off and Enter always sends, full stop.
+    pub paste_detect: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            notify: Notify::default(),
+            snooze_until: 0,
+            paste_detect: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
