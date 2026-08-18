@@ -32,7 +32,8 @@ enum SyncMsg {
 #[derive(Debug, Clone)]
 pub enum NetEvent {
     Status(String),
-    Peers(usize),
+    /// Full roster of live neighbours, so the UI can name who joined or left.
+    Peers(Vec<EndpointId>),
     Record,
     Ticket(String),
 }
@@ -82,6 +83,7 @@ pub struct NetSession {
     gossip_tx: GossipSender,
     endpoint: Endpoint,
     presence: Presence,
+    known: Arc<Mutex<Vec<EndpointAddr>>>,
 }
 
 impl NetSession {
@@ -160,7 +162,7 @@ impl NetSession {
             memory,
             presence.clone(),
             topic_hex,
-            known,
+            known.clone(),
             events,
         ));
 
@@ -169,7 +171,15 @@ impl NetSession {
             gossip_tx: sender,
             endpoint,
             presence,
+            known,
         })
+    }
+
+    /// Addresses we have a route to, whether or not gossip has them live.
+    /// A non-zero count here with zero live peers means discovery worked and
+    /// the connection did not — worth telling the user apart.
+    pub async fn known_count(&self) -> usize {
+        self.known.lock().await.len()
     }
 
     pub async fn broadcast(&self, rec: &Record) -> Result<()> {
@@ -208,12 +218,11 @@ async fn gossip_loop(
             }
             Event::NeighborUp(id) => {
                 peers.insert(id);
-                let _ = events.send(NetEvent::Peers(peers.len()));
-                let _ = events.send(NetEvent::Status(format!("peer up {}", short_id(&id))));
+                let _ = events.send(NetEvent::Peers(peers.iter().copied().collect()));
             }
             Event::NeighborDown(id) => {
                 peers.remove(&id);
-                let _ = events.send(NetEvent::Peers(peers.len()));
+                let _ = events.send(NetEvent::Peers(peers.iter().copied().collect()));
             }
             _ => {}
         }
@@ -402,7 +411,7 @@ async fn presence_loop(
     }
 }
 
-fn short_id(id: &EndpointId) -> String {
+pub fn short_id(id: &EndpointId) -> String {
     let s = id.to_string();
     s.chars().take(8).collect()
 }

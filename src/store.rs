@@ -152,6 +152,38 @@ impl DataDir {
         self.root.join("device.key")
     }
 
+    fn pin_path(&self, topic: &[u8; 32]) -> PathBuf {
+        self.room_dir(topic).join("pin.dpapi")
+    }
+
+    /// Stores the pin under DPAPI so this Windows user can reopen the room
+    /// without retyping it. The topic doubles as entropy, so a blob lifted
+    /// from one room cannot unlock another.
+    pub fn remember_pin(&self, topic: &[u8; 32], pin: &Pin) -> Result<()> {
+        let sealed = crate::sys::protect(pin.normalized().as_bytes(), topic)
+            .ok_or_else(|| anyhow!("windows refused to protect the key"))?;
+        fs::create_dir_all(self.room_dir(topic))?;
+        fs::write(self.pin_path(topic), sealed).context("save protected pin")
+    }
+
+    pub fn recall_pin(&self, topic: &[u8; 32]) -> Option<Pin> {
+        let sealed = fs::read(self.pin_path(topic)).ok()?;
+        let plain = crate::sys::unprotect(&sealed, topic)?;
+        Pin::parse(&String::from_utf8(plain).ok()?).ok()
+    }
+
+    pub fn has_pin(&self, topic: &[u8; 32]) -> bool {
+        self.pin_path(topic).exists()
+    }
+
+    pub fn forget_pin(&self, topic: &[u8; 32]) -> Result<()> {
+        let path = self.pin_path(topic);
+        if path.exists() {
+            fs::remove_file(path).context("remove protected pin")?;
+        }
+        Ok(())
+    }
+
     pub fn index_path(&self) -> PathBuf {
         self.root.join("index.toml")
     }
@@ -252,8 +284,13 @@ impl RoomLog {
         if bytes.len() < MAGIC.len() || &bytes[..MAGIC.len()] != MAGIC {
             return Err(anyhow!("not a local-llm log"));
         }
-        let mut records = Vec::new();
-        let mut seen = BTreeMap::new();
+        let mut log = Self {
+            path,
+            key,
+            records: Vec::new(),
+            seen: BTreeMap::new(),
+        };
+        let mut duplicates = 0usize;
         let mut offset = MAGIC.len();
         while offset + 4 <= bytes.len() {
             let len = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
@@ -261,20 +298,60 @@ impl RoomLog {
             if offset + len > bytes.len() {
                 return Err(anyhow!("truncated log"));
             }
-            let plain = key.open(&bytes[offset..offset + len])?;
+            let plain = log.key.open(&bytes[offset..offset + len])?;
             offset += len;
             let rec = Record::decode(&plain)?;
-            if let Some(key) = rec.chat_key() {
-                seen.insert(key, ());
+            if log.is_new(&rec) {
+                log.remember(rec);
+            } else {
+                duplicates += 1;
             }
-            records.push(rec);
         }
-        Ok(Self {
-            path,
-            key,
-            records,
-            seen,
-        })
+        // Older builds appended a fresh Meta on every sync round, so logs in
+        // the wild carry thousands of copies. Rewrite them once, on open.
+        if duplicates > 0 {
+            log.rewrite().context("compact log")?;
+        }
+        Ok(log)
+    }
+
+    /// A chat record is identified by (author, seq); a Meta by its alias. The
+    /// sync protocol has no way to tell that the other side already has a
+    /// Meta, so this is the only thing standing between it and an
+    /// ever-growing log.
+    fn is_new(&self, rec: &Record) -> bool {
+        match rec.chat_key() {
+            Some(key) => !self.seen.contains_key(&key),
+            None => match rec {
+                Record::Meta { alias } => !self
+                    .records
+                    .iter()
+                    .any(|held| matches!(held, Record::Meta { alias: had } if had == alias)),
+                _ => true,
+            },
+        }
+    }
+
+    fn remember(&mut self, rec: Record) {
+        if let Some(key) = rec.chat_key() {
+            self.seen.insert(key, ());
+        }
+        self.records.push(rec);
+    }
+
+    /// Rewrites the whole log from what is in memory, atomically.
+    fn rewrite(&self) -> Result<()> {
+        let mut bytes = MAGIC.to_vec();
+        for rec in &self.records {
+            let sealed = self.key.seal(&rec.encode()?)?;
+            let len = u32::try_from(sealed.len()).context("record too large")?;
+            bytes.extend_from_slice(&len.to_le_bytes());
+            bytes.extend_from_slice(&sealed);
+        }
+        let staging = self.path.with_extension("bin.new");
+        fs::write(&staging, &bytes)?;
+        fs::rename(&staging, &self.path)?;
+        Ok(())
     }
 
     pub fn records(&self) -> &[Record] {
@@ -317,11 +394,8 @@ impl RoomLog {
     }
 
     pub fn append(&mut self, rec: Record) -> Result<bool> {
-        if let Some(key) = rec.chat_key() {
-            if self.seen.contains_key(&key) {
-                return Ok(false);
-            }
-            self.seen.insert(key, ());
+        if !self.is_new(&rec) {
+            return Ok(false);
         }
         let sealed = self.key.seal(&rec.encode()?)?;
         let mut file = OpenOptions::new()
@@ -335,7 +409,7 @@ impl RoomLog {
         file.write_all(&len.to_le_bytes())?;
         file.write_all(&sealed)?;
         file.flush()?;
-        self.records.push(rec);
+        self.remember(rec);
         Ok(true)
     }
 
@@ -416,6 +490,63 @@ mod tests {
         assert_eq!(dir.load_nick(), "user");
         dir.save_nick("Diamante").unwrap();
         assert_eq!(dir.load_nick(), "Diamante");
+    }
+
+    #[test]
+    fn repeated_meta_from_sync_is_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let dir = DataDir::from_path(tmp.path().to_path_buf()).unwrap();
+        let pin = Pin::parse("EEEE-FFFF").unwrap();
+        let mut log = RoomLog::open_or_create(&dir, &pin, Some("qwen")).unwrap();
+        assert_eq!(log.records().len(), 1);
+
+        // Every sync round hands us the peer's Meta again.
+        for _ in 0..50 {
+            assert!(!log
+                .append(Record::Meta {
+                    alias: "qwen".into()
+                })
+                .unwrap());
+        }
+        assert_eq!(log.records().len(), 1);
+    }
+
+    #[test]
+    fn reopening_compacts_a_log_polluted_by_the_old_sync_bug() {
+        use crate::crypto::RoomKey;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = DataDir::from_path(tmp.path().to_path_buf()).unwrap();
+        let pin = Pin::parse("GGGG-HHHH").unwrap();
+        let topic = crate::crypto::topic_id(&pin);
+        let key = RoomKey::derive(&pin).unwrap();
+        let room = dir.room_dir(&topic);
+        fs::create_dir_all(&room).unwrap();
+        let path = room.join("log.bin");
+
+        let mut bytes = MAGIC.to_vec();
+        for _ in 0..500 {
+            let sealed = key
+                .seal(
+                    &Record::Meta {
+                        alias: "teste".into(),
+                    }
+                    .encode()
+                    .unwrap(),
+                )
+                .unwrap();
+            bytes.extend_from_slice(&(sealed.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(&sealed);
+        }
+        fs::write(&path, &bytes).unwrap();
+        let bloated = fs::metadata(&path).unwrap().len();
+
+        let log = RoomLog::open_or_create(&dir, &pin, None).unwrap();
+        assert_eq!(log.records().len(), 1, "should collapse to one Meta");
+        assert!(
+            fs::metadata(&path).unwrap().len() < bloated / 10,
+            "the file itself should shrink, not just the in-memory view"
+        );
     }
 
     #[test]

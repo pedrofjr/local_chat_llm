@@ -2,6 +2,7 @@ mod crypto;
 mod net;
 mod room;
 mod store;
+mod sys;
 mod tui;
 
 fn main() -> anyhow::Result<()> {
