@@ -13,7 +13,7 @@ local-llm
 A interface é toda em inglês, para combinar com a fachada de client de modelo.
 
 ```
-  local-llm  0.3.2
+  local-llm  0.3.3
 
   sessions
   >  gpt-oss-20b              ready
@@ -31,7 +31,7 @@ com um Enter. `locked` pede a chave.
 | `/new gpt-oss-20b` | cria a sala, mostra a chave **no corpo do chat** e copia pro clipboard |
 | `/join 7K2M-9QXP` | entra; puxa o histórico dos peers online |
 | `/join 7K2M-9QXP <ticket>` | igual, mas disca um peer na unha (mDNS falhou) |
-| `/w Diamante <texto>` | sussurro: só ele lê. `Tab` completa o nome |
+| `/w Diamante <texto>` | sussurro: só ele lê. Nome com espaço funciona; `Tab` completa |
 | `/nick Diamante` | muda o nome; mensagens antigas ficam com o nome de quando foram enviadas |
 | `/notify` | `all`, `mention`, `off`, ou `30m` para calar por um tempo |
 | `/pin` | mostra a chave de novo e copia |
@@ -168,7 +168,8 @@ menos de 5 ms, coisa que ninguém digita. `Enter` digitado sempre envia.
 
 Se ainda assim atrapalhar, `/paste off` desliga a detecção: `Enter` passa a
 sempre enviar e um bloco colado volta a virar uma mensagem por linha.
-`Shift+Enter` quebra linha em qualquer um dos modos.
+`Shift+Enter` quebra linha em qualquer um dos modos — e `Alt+Enter` e
+`Ctrl+Enter` fazem o mesmo, para o caso de o terminal engolir o Shift.
 
 A chave é um código Crockford (`7K2M-9QXP`). Fala no corredor. **Não manda no
 Teams.** Quem lê o Teams lê a sala.
@@ -184,7 +185,7 @@ cargo build --release
 O exe sai em `target\release\local-llm.exe`. Alvo: &lt; 8 MB.
 
 ```powershell
-Compress-Archive -Path target\release\local-llm.exe -DestinationPath local-llm-0.3.2-windows-x64.zip -Force
+Compress-Archive -Path target\release\local-llm.exe -DestinationPath local-llm-0.3.3-windows-x64.zip -Force
 ```
 
 ## Como compartilhar

@@ -335,10 +335,16 @@ impl App {
         }
     }
 
+    /// Adds a line to the transcript. Deliberately does not jump to the
+    /// bottom: someone reading back must not be yanked away because a peer
+    /// showed up.
     fn notice(&mut self, body: impl Into<String>) {
         self.feed.push(Feed::Notice { body: body.into() });
-        self.follow = true;
-        self.unread = 0;
+        if self.follow {
+            self.unread = 0;
+        } else {
+            self.unread += 1;
+        }
     }
 
     async fn shutdown_net(&mut self) {
@@ -422,14 +428,33 @@ impl App {
             .filter(|i| matches!(self.feed.get(*i), Some(Feed::Msg { .. })))
     }
 
-    /// Finds someone by the name they are using, ignoring case. Only other
-    /// people: whispering to yourself is not a thing.
-    fn resolve_nick(&self, who: &str) -> Option<[u8; 32]> {
-        let who = who.trim().to_lowercase();
-        self.names
-            .iter()
-            .find(|(id, name)| **id != self.me && name.to_lowercase() == who)
-            .map(|(id, _)| *id)
+    /// Splits "<name> <message>" where the name may itself contain spaces --
+    /// people call themselves things like "Grok 4.5". Matches the longest
+    /// known nick the line starts with, so no quoting is needed.
+    fn split_whisper<'a>(&self, after: &'a str) -> Option<([u8; 32], &'a str)> {
+        let mut best: Option<([u8; 32], usize)> = None;
+        for (id, name) in &self.names {
+            if *id == self.me || name.is_empty() {
+                continue;
+            }
+            let Some(head) = after.get(..name.len()) else {
+                continue;
+            };
+            if !head.eq_ignore_ascii_case(name) {
+                continue;
+            }
+            let rest = &after[name.len()..];
+            // The name has to end where a word ends, or "Ana" would match
+            // inside "Anabela".
+            if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+                continue;
+            }
+            if best.is_none_or(|(_, best_len)| name.len() > best_len) {
+                best = Some((*id, name.len()));
+            }
+        }
+        let (id, len) = best?;
+        Some((id, after[len..].trim_start()))
     }
 
     /// Who has beaten recently, by name. Whoever went quiet simply ages out,
@@ -660,6 +685,11 @@ async fn apply_net(app: &mut App, ev: NetEvent) {
         // Neighbours come and go as the overlay rearranges itself; that is
         // not somebody entering or leaving the room, so it says nothing.
         NetEvent::Peers(list) => app.peers = list,
+        NetEvent::Searching(count) => {
+            if app.live_now().is_empty() {
+                app.status = format!("looking for {count} known peer(s)…");
+            }
+        }
         NetEvent::Live { author, name } => {
             app.names.insert(author, name.clone());
             let arriving = app
@@ -913,10 +943,12 @@ fn copy_message(app: &mut App, idx: usize) {
 /// rather than an exact spelling.
 fn complete_nick(app: &mut App) {
     let text = app.input.text.clone();
-    let Some((head, partial)) = text.rsplit_once(' ') else {
+    // Everything after the command is the candidate, so a name with spaces in
+    // it can still be completed.
+    let Some((cmd, partial)) = text.split_once(' ') else {
         return;
     };
-    if !matches!(head, "/w" | "/whisper") {
+    if !matches!(cmd, "/w" | "/whisper") {
         return;
     }
     let partial = partial.to_lowercase();
@@ -927,7 +959,7 @@ fn complete_nick(app: &mut App) {
         .map(|(_, name)| name.clone())
         .find(|name| name.to_lowercase().starts_with(&partial));
     if let Some(name) = hit {
-        app.input.text = format!("{head} {name} ");
+        app.input.text = format!("{cmd} {name} ");
         app.input.cursor = app.input.len();
     }
 }
@@ -1180,8 +1212,12 @@ async fn handle_chat<B: Backend>(
         }
         KeyCode::Up => app.input.recall_prev(),
         KeyCode::Down => app.input.recall_next(),
-        // A newline inside a paste belongs to the message, not to the send key.
-        KeyCode::Enter if shift || (pasting && app.settings.paste_detect) => {
+        // Shift+Enter is the usual one, but some terminals swallow it, so alt
+        // and ctrl do the same. A newline inside a paste belongs to the
+        // message rather than to the send key.
+        KeyCode::Enter
+            if shift || alt || is_shortcut(&key) || (pasting && app.settings.paste_detect) =>
+        {
             app.input.insert('\n')
         }
         KeyCode::Enter => {
@@ -1863,18 +1899,19 @@ async fn whisper_cmd(app: &mut App, line: &str) {
         .split_once(char::is_whitespace)
         .map(|(_, rest)| rest.trim_start())
         .unwrap_or("");
-    let (who, text) = match after.split_once(char::is_whitespace) {
-        Some((who, text)) => (who, text.trim()),
-        None => (after, ""),
+    let Some((target, text)) = app.split_whisper(after) else {
+        if after.trim().is_empty() {
+            app.status = "usage: /w <name> <message>   (tab completes the name)".into();
+        } else {
+            app.status = format!("nobody here answers to that: {after}");
+        }
+        return;
     };
-    if who.is_empty() || text.is_empty() {
+    if text.is_empty() {
         app.status = "usage: /w <name> <message>   (tab completes the name)".into();
         return;
     }
-    let Some(target) = app.resolve_nick(who) else {
-        app.status = format!("nobody here answers to {who} yet");
-        return;
-    };
+    let text = text.to_string();
     let Some(room) = app.room.clone() else { return };
     let rec = {
         let mut room = room.lock().await;
@@ -2171,7 +2208,14 @@ fn build_lines(app: &App, width: u16) -> Transcript {
                 let quote = reply_to.filter(|_| !app.masked).map(|key| match app.by_key.get(&key) {
                     Some(at) => match app.feed.get(*at) {
                         Some(Feed::Msg { name, body, .. }) => {
-                            format!("{QUOTE_MARK} {name}: {}", one_line(body, bubble / 2))
+                            // A quote must obey the blur too, or answering a
+                            // hidden message would put it right back on screen.
+                            let text = if app.hidden.contains(&key) {
+                                blur(body)
+                            } else {
+                                body.clone()
+                            };
+                            format!("{QUOTE_MARK} {name}: {}", one_line(&text, bubble / 2))
                         }
                         _ => format!("{QUOTE_MARK} (message not here yet)"),
                     },
@@ -3011,9 +3055,6 @@ mod tests {
         h.cmd("/w").await;
         assert!(h.app.status.contains("usage"));
 
-        h.cmd("/w Fulano").await;
-        assert!(h.app.status.contains("usage"), "a name alone is not a message");
-
         h.cmd("/w Fulano oi tudo bem").await;
         assert!(
             h.app.status.contains("Fulano"),
@@ -3021,12 +3062,66 @@ mod tests {
             h.app.status
         );
 
-        // Tab completion fills the name in from who has spoken.
         h.app.names.insert([9u8; 32], "Diamante".into());
+        h.cmd("/w Diamante").await;
+        assert!(
+            h.app.status.contains("usage"),
+            "a name alone is not a message"
+        );
+
+        // Tab completion fills the name in from who has spoken.
         h.app.input.clear();
         h.app.input.insert_str("/w dia");
         h.press(KeyCode::Tab).await;
         assert_eq!(h.app.input.text, "/w Diamante ");
+    }
+
+    #[tokio::test]
+    async fn a_whisper_target_may_have_spaces_in_its_name() {
+        let mut h = Harness::new();
+        h.cmd("/new gpt-oss-20b").await;
+        h.app.names.insert([9u8; 32], "Grok 4.5".into());
+        h.app.names.insert([7u8; 32], "Grok".into());
+
+        // The longest matching name wins, otherwise "Grok 4.5 e ai" would be
+        // read as a whisper to "Grok" saying "4.5 e ai".
+        assert_eq!(
+            h.app.split_whisper("Grok 4.5 e ai"),
+            Some(([9u8; 32], "e ai"))
+        );
+        assert_eq!(h.app.split_whisper("Grok e ai"), Some(([7u8; 32], "e ai")));
+        // Case does not matter, unknown names do.
+        assert_eq!(h.app.split_whisper("grok 4.5 oi"), Some(([9u8; 32], "oi")));
+        assert_eq!(h.app.split_whisper("Fulano oi"), None);
+        // And a name must end on a word boundary.
+        assert_eq!(h.app.split_whisper("Grokzinho oi"), None);
+
+        // Tab completes across the space too.
+        h.app.input.clear();
+        h.app.input.insert_str("/w grok 4");
+        h.press(KeyCode::Tab).await;
+        assert_eq!(h.app.input.text, "/w Grok 4.5 ");
+    }
+
+    #[tokio::test]
+    async fn answering_a_hidden_message_does_not_quote_it_back_onto_the_screen() {
+        let mut h = Harness::new();
+        h.cmd("/nick Pedro").await;
+        h.cmd("/new gpt-oss-20b").await;
+        push_peer(&mut h.app, [9u8; 32], 3, "Dale", "aquilo que eu escondi");
+
+        let idx = h.app.feed.len() - 1;
+        toggle_hidden(&mut h.app, idx).await;
+        arm_reply(&mut h.app, idx);
+        send(&mut h.app, "respondendo".into()).await;
+
+        let painted = h.painted();
+        assert!(painted.contains("respondendo"));
+        assert!(
+            !painted.contains("aquilo que eu escondi"),
+            "the quote put the hidden message straight back on screen"
+        );
+        assert!(painted.contains(BLOCK), "it should still show as blurred");
     }
 
     #[tokio::test]

@@ -68,6 +68,9 @@ pub enum NetEvent {
     Peers(Vec<EndpointId>),
     /// Somebody announced they are here, right now.
     Live { author: [u8; 32], name: String },
+    /// Knocking on remembered addresses. Only worth saying out loud when the
+    /// room still looks empty, which the UI knows and the network does not.
+    Searching(usize),
     Record,
     Ticket(String),
 }
@@ -586,10 +589,7 @@ async fn presence_loop(
             // Already-connected peers are simply ignored by gossip, so this is
             // safe to repeat.
             let _ = gossip_tx.join_peers(targets.clone()).await;
-            let _ = events.send(NetEvent::Status(format!(
-                "reaching {} known peer(s)…",
-                targets.len()
-            )));
+            let _ = events.send(NetEvent::Searching(targets.len()));
         }
         (step, countdown) = next_backoff(step);
     }

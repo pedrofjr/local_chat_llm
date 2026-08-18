@@ -121,7 +121,24 @@ Binário: LTO fat, `opt-level = "s"`, strip, panic=abort. Alvo &lt; 8 MB. Teams 
 
 ## Onde paramos (18/ago/2026)
 
-Estado no git: branch `main`, versão **0.3.2**.
+Estado no git: branch `main`, versão **0.3.3**.
+
+### Achados de uso real (0.3.3)
+
+Reportados pelo grupo depois de um dia de uso:
+
+- **`/w` não aceitava nome com espaço** ("Grok 4.5"). `split_whisper` passou a
+  casar o **nick conhecido mais longo** com que a linha começa, exigindo
+  limite de palavra — sem aspas, e "Ana" não casa dentro de "Anabela".
+- **Responder a uma mensagem escondida devolvia o texto à tela** pela linha de
+  citação. A citação agora obedece ao borrão.
+- **`reaching N known peer(s)…` poluía a barra** mesmo com a sala cheia. Virou
+  `NetEvent::Searching`, e a UI só mostra quando ninguém está online — a rede
+  não sabe quem está presente, a UI sabe.
+- **`notice()` roubava a rolagem**: qualquer aviso puxava a tela para o fim de
+  quem estava lendo para trás. Agora respeita a posição e conta como não lida.
+- `Alt+Enter` e `Ctrl+Enter` viraram sinônimos de `Shift+Enter`, para o caso de
+  o terminal engolir a combinação.
 
 ### Detecção de colagem, segunda tentativa (0.3.1)
 
