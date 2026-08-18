@@ -62,8 +62,12 @@ enum SyncMsg {
 #[derive(Debug, Clone)]
 pub enum NetEvent {
     Status(String),
-    /// Full roster of live neighbours, so the UI can name who joined or left.
+    /// Direct gossip neighbours. This is overlay topology, not who is in the
+    /// room -- messages travel several hops, so a peer can be present without
+    /// ever being a neighbour. Kept for diagnostics only.
     Peers(Vec<EndpointId>),
+    /// Somebody announced they are here, right now.
+    Live { author: [u8; 32], name: String },
     Record,
     Ticket(String),
 }
@@ -103,6 +107,60 @@ impl ProtocolHandler for SyncState {
         }
         connection.closed().await;
         Ok(())
+    }
+}
+
+/// How often we say we are here. Also how fast a room converges: each beat
+/// carries the sender's address, so a peer that joined with a single ticket
+/// learns everybody within a beat or two instead of waiting for the overlay's
+/// own shuffle, which runs on the order of a minute.
+const HEARTBEAT: Duration = Duration::from_secs(5);
+
+/// The live view of the room: who we can reach and how to reach them.
+#[derive(Clone)]
+struct Mesh {
+    me: EndpointId,
+    endpoint: Endpoint,
+    memory: MemoryLookup,
+    known: Arc<Mutex<Vec<EndpointAddr>>>,
+    gossip_tx: GossipSender,
+}
+
+impl Mesh {
+    /// Takes an address we heard about and dials it if it is new.
+    async fn learn(&self, addr: EndpointAddr) -> bool {
+        if addr.id == self.me {
+            return false;
+        }
+        let addr = localize_addr(addr);
+        self.memory.add_endpoint_info(addr.clone());
+        {
+            let mut known = self.known.lock().await;
+            if known.iter().any(|a| a.id == addr.id) {
+                return false;
+            }
+            known.push(addr.clone());
+        }
+        let _ = self.gossip_tx.join_peers(vec![addr.id]).await;
+        true
+    }
+
+    async fn beat(&self, room: &Arc<Mutex<OpenRoom>>) {
+        let Ok(addr) = postcard::to_stdvec(&localize_addr(self.endpoint.addr())) else {
+            return;
+        };
+        let rec = { room.lock().await.compose_presence(addr) };
+        if let Ok(bytes) = postcard::to_stdvec(&rec) {
+            let _ = self.gossip_tx.broadcast(Bytes::from(bytes)).await;
+        }
+    }
+}
+
+async fn heartbeat_loop(mesh: Mesh, room: Arc<Mutex<OpenRoom>>) {
+    let mut ticks = tokio::time::interval(HEARTBEAT);
+    loop {
+        ticks.tick().await;
+        mesh.beat(&room).await;
     }
 }
 
@@ -192,7 +250,20 @@ impl NetSession {
         let (sender, receiver) = topic_handle.split();
 
         let known = Arc::new(Mutex::new(bootstrap));
-        tokio::spawn(gossip_loop(receiver, room.clone(), events.clone()));
+        let mesh = Mesh {
+            me,
+            endpoint: endpoint.clone(),
+            memory: memory.clone(),
+            known: known.clone(),
+            gossip_tx: sender.clone(),
+        };
+        tokio::spawn(gossip_loop(
+            receiver,
+            room.clone(),
+            events.clone(),
+            mesh.clone(),
+        ));
+        tokio::spawn(heartbeat_loop(mesh, room.clone()));
         tokio::spawn(sync_loop(
             endpoint.clone(),
             room.clone(),
@@ -247,17 +318,37 @@ async fn gossip_loop(
     mut receiver: iroh_gossip::api::GossipReceiver,
     room: Arc<Mutex<OpenRoom>>,
     events: mpsc::UnboundedSender<NetEvent>,
+    mesh: Mesh,
 ) {
     let mut peers: HashSet<EndpointId> = HashSet::new();
     while let Some(event) = receiver.next().await {
         let Ok(event) = event else { continue };
         match event {
             Event::Received(msg) => {
-                if let Ok(rec) = postcard::from_bytes::<Record>(&msg.content) {
-                    let mut room = room.lock().await;
-                    if let Ok(true) = room.ingest(rec) {
-                        let _ = events.send(NetEvent::Record);
+                // Anything this build cannot parse is dropped, which is what
+                // lets a newer peer's traffic pass an older one harmlessly.
+                let Ok(rec) = postcard::from_bytes::<Record>(&msg.content) else {
+                    continue;
+                };
+                if let Record::Presence { author, name, addr, .. } = &rec {
+                    let (author, name, addr) = (*author, name.clone(), addr.clone());
+                    // The signature is checked here; ingest stores nothing.
+                    if room.lock().await.ingest(rec).is_err() {
+                        continue;
                     }
+                    if let Ok(peer) = postcard::from_bytes::<EndpointAddr>(&addr) {
+                        if mesh.learn(peer).await {
+                            // Answer straight away so they learn us too,
+                            // instead of both sides waiting a beat.
+                            mesh.beat(&room).await;
+                        }
+                    }
+                    let _ = events.send(NetEvent::Live { author, name });
+                    continue;
+                }
+                let mut room = room.lock().await;
+                if let Ok(true) = room.ingest(rec) {
+                    let _ = events.send(NetEvent::Record);
                 }
             }
             Event::NeighborUp(id) => {
@@ -502,11 +593,6 @@ async fn presence_loop(
         }
         (step, countdown) = next_backoff(step);
     }
-}
-
-pub fn short_id(id: &EndpointId) -> String {
-    let s = id.to_string();
-    s.chars().take(8).collect()
 }
 
 pub fn encode_ticket(addr: &EndpointAddr) -> String {

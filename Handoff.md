@@ -121,7 +121,31 @@ Binário: LTO fat, `opt-level = "s"`, strip, panic=abort. Alvo &lt; 8 MB. Teams 
 
 ## Onde paramos (18/ago/2026)
 
-Estado no git: branch `main`, versão **0.3.0**.
+Estado no git: branch `main`, versão **0.3.1**.
+
+### Presença de verdade (0.3.1)
+
+O contador dizia "1 online" com três pessoas conversando: ele contava
+`NeighborUp`/`NeighborDown` do gossip, que é **topologia do overlay**, não
+presença. Mensagem viaja por vários saltos (ou chega pelo sync ALPN), então dá
+para receber alguém sem nunca ser vizinho dele.
+
+A mesma causa explicava o "depois de um ou dois minutos se resolve sozinho":
+quem entra por ticket conhece **uma** pessoa, e o iroh-gossip só apresenta o
+resto no shuffle dele, que roda na casa do minuto.
+
+Agora existe `Record::Presence` — anunciado a cada 5 s pelo gossip, assinado,
+**nunca gravado no log** (vale por segundos; guardar seria inútil e sem
+limite). Ele carrega o endereço de quem mandou, então a sala converge em
+segundos: ao aprender alguém novo o app responde na hora, para o outro lado
+aprender junto. Some da lista após 20 s calado (`PRESENCE_TTL`).
+
+Cabeçalho, `/peers` e `/diag` passam a distinguir "quem está na sala" de
+"quantos vizinhos de gossip". Entrar/sair deixou de ser anunciado por
+rearranjo do overlay.
+
+**Compatível com a 0.3.0**: a variante nova não decodifica em build antigo, e o
+`gossip_loop` de lá já ignorava o que não entende.
 
 ### Rodada de atrito (0.3.0)
 

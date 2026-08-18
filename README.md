@@ -13,7 +13,7 @@ local-llm
 A interface é toda em inglês, para combinar com a fachada de client de modelo.
 
 ```
-  local-llm  0.3.0
+  local-llm  0.3.1
 
   sessions
   >  gpt-oss-20b              ready
@@ -108,6 +108,17 @@ ler. Isso vale **só na sua tela**: nada vai para o log nem para os outros, e
 fica guardado nesta máquina (cifrado, junto com a sala). Alternar revela de
 novo, e continua revelada até você esconder outra vez.
 
+## Quem está online
+
+O cabeçalho e o `/peers` mostram **quem está na sala**, não com quem seu app
+tem conexão direta. Cada um anuncia presença a cada 5 s pelo gossip, e some da
+lista depois de 20 s calado.
+
+Esse anúncio carrega o endereço de quem o mandou, e é isso que faz a sala
+fechar rápido: quem entra com um único `ticket` conhece **uma** pessoa, e o
+gossip só apresenta o resto no shuffle dele, que roda na casa do minuto. Com o
+anúncio, todo mundo se acha em segundos.
+
 ## Voltar pra sala
 
 O app **lembra o endereço de quem já encontrou** naquela sala e volta a
@@ -168,7 +179,7 @@ cargo build --release
 O exe sai em `target\release\local-llm.exe`. Alvo: &lt; 8 MB.
 
 ```powershell
-Compress-Archive -Path target\release\local-llm.exe -DestinationPath local-llm-0.3.0-windows-x64.zip -Force
+Compress-Archive -Path target\release\local-llm.exe -DestinationPath local-llm-0.3.1-windows-x64.zip -Force
 ```
 
 ## Como compartilhar
@@ -231,3 +242,5 @@ Fechar o terminal **não** apaga o histórico. `/forget` apaga. Sem o PIN o arqu
   último recurso.
 - Esconder mensagem é **visual e local**. A mensagem continua inteira no log, e
   quem tiver a chave da sala lê normalmente.
+- Presença é o que cada um **diz** de si, assinado. Não é prova de que a pessoa
+  está na frente da máquina, e some sozinha depois de 20 s sem sinal.

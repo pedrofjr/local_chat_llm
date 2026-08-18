@@ -119,6 +119,18 @@ impl OpenRoom {
                 ct,
                 sig,
             } => verify_sig(author, sig, &whisper_payload(author, *seq, *ts, to, ct))?,
+            // Verified like anything else, but deliberately not stored: it
+            // says where someone is now, which is worthless a minute later.
+            Record::Presence {
+                author,
+                name,
+                addr,
+                ts,
+                sig,
+            } => {
+                verify_sig(author, sig, &presence_payload(author, name, addr, *ts))?;
+                return Ok(false);
+            }
             Record::Meta { .. } => {}
         }
         self.log.append(rec)
@@ -207,6 +219,21 @@ impl OpenRoom {
         Some((opened.name, opened.body, them))
     }
 
+    /// Says we are here, under the name we are using, and where to find us.
+    pub fn compose_presence(&self, addr: Vec<u8>) -> Record {
+        let ts = now_ts();
+        let sig = self
+            .secret
+            .sign(&presence_payload(&self.author, &self.nick, &addr, ts));
+        Record::Presence {
+            author: self.author,
+            name: self.nick.clone(),
+            addr,
+            ts,
+            sig: sig.to_bytes().to_vec(),
+        }
+    }
+
     pub fn label_of(&self, rec: &Record) -> String {
         match rec {
             Record::ChatNamed { name, .. } | Record::Post { name, .. } => name.clone(),
@@ -217,6 +244,7 @@ impl OpenRoom {
                     role_for(author).to_string()
                 }
             }
+            Record::Presence { name, .. } => name.clone(),
             Record::Meta { .. } | Record::Identity { .. } => "system".into(),
         }
     }
@@ -277,6 +305,13 @@ fn post_payload(
             body.as_bytes(),
             &answered,
         ],
+    )
+}
+
+pub fn presence_payload(author: &[u8; 32], name: &str, addr: &[u8], ts: u64) -> Vec<u8> {
+    signed_bytes(
+        "local-llm/presence/v1",
+        &[author, name.as_bytes(), addr, &ts.to_le_bytes()],
     )
 }
 
@@ -379,6 +414,40 @@ mod tests {
         // And the sender can reread what they sent.
         let (_, mine, _) = a.open_whisper(&sealed).expect("sender rereads it");
         assert_eq!(mine, "o chefe vem quinta");
+    }
+
+    #[test]
+    fn a_heartbeat_is_checked_but_never_stored() {
+        let pin = Pin::parse("HHHH-JJJJ").unwrap();
+        let (ta, tb) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let (a, mut b) = (open_at(&ta, &pin), open_at(&tb, &pin));
+
+        let before = b.log.records().len();
+        let beat = a.compose_presence(b"endereco".to_vec());
+        assert!(
+            !b.ingest(beat.clone()).unwrap(),
+            "presence is a live fact, it must not enter the history"
+        );
+        assert_eq!(b.log.records().len(), before, "and must not grow the log");
+
+        // Even repeated, it never accumulates.
+        for _ in 0..20 {
+            b.ingest(beat.clone()).unwrap();
+        }
+        assert_eq!(b.log.records().len(), before);
+
+        // Somebody else cannot beat in your name.
+        let Record::Presence { name, addr, ts, sig, .. } = beat else {
+            panic!("expected presence");
+        };
+        let forged = Record::Presence {
+            author: b.author,
+            name,
+            addr,
+            ts,
+            sig,
+        };
+        assert!(b.ingest(forged).is_err());
     }
 
     #[test]

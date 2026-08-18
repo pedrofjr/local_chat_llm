@@ -47,6 +47,17 @@ pub enum Record {
         reply_to: Option<([u8; 32], u64)>,
         sig: Vec<u8>,
     },
+    /// Heartbeat: "I am in this room, right now". Never written to the log --
+    /// being present is a live fact, not history. Carries the sender's own
+    /// address, which is what lets someone who only knows A end up connected
+    /// to B as well: A's heartbeat introduces everyone it can reach.
+    Presence {
+        author: [u8; 32],
+        name: String,
+        addr: Vec<u8>,
+        ts: u64,
+        sig: Vec<u8>,
+    },
     /// A message only `to` can read. Everyone else keeps the bytes and can
     /// still check the signature, but the plaintext is not theirs to have.
     Whisper {
@@ -78,7 +89,7 @@ impl Record {
             | Record::ChatNamed { author, seq, .. }
             | Record::Post { author, seq, .. }
             | Record::Whisper { author, seq, .. } => Some((*author, *seq)),
-            Record::Meta { .. } | Record::Identity { .. } => None,
+            Record::Meta { .. } | Record::Identity { .. } | Record::Presence { .. } => None,
         }
     }
 
@@ -89,7 +100,10 @@ impl Record {
             Record::Chat { body, .. }
             | Record::ChatNamed { body, .. }
             | Record::Post { body, .. } => Some(body),
-            Record::Meta { .. } | Record::Identity { .. } | Record::Whisper { .. } => None,
+            Record::Meta { .. }
+            | Record::Identity { .. }
+            | Record::Whisper { .. }
+            | Record::Presence { .. } => None,
         }
     }
 
@@ -99,7 +113,8 @@ impl Record {
             | Record::ChatNamed { author, .. }
             | Record::Post { author, .. }
             | Record::Whisper { author, .. }
-            | Record::Identity { author, .. } => Some(author),
+            | Record::Identity { author, .. }
+            | Record::Presence { author, .. } => Some(author),
             Record::Meta { .. } => None,
         }
     }
@@ -423,6 +438,9 @@ impl RoomLog {
                 Record::Identity { author, .. } => !self.records.iter().any(
                     |held| matches!(held, Record::Identity { author: had, .. } if had == author),
                 ),
+                // A heartbeat is true for a few seconds and then it is not.
+                // Keeping it would be both useless and unbounded.
+                Record::Presence { .. } => false,
                 _ => true,
             },
         }

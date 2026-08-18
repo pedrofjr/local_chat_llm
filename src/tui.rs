@@ -1,5 +1,5 @@
 use crate::crypto::{color_for, role_for, topic_id, Pin};
-use crate::net::{parse_ticket, short_id, NetEvent, NetSession, Presence};
+use crate::net::{parse_ticket, NetEvent, NetSession, Presence};
 use crate::room::OpenRoom;
 use crate::store::{now_ts, DataDir, Notify, Record, Settings};
 use anyhow::Result;
@@ -31,6 +31,9 @@ const HOME_HINT: &str = "/new <name>   /join <key>   /nick <name>   /help   /qui
 const CHAT_HINT: &str = "/help for commands   f12 hides names   esc clears the line";
 /// What the status bar says while the disguise is on. Never mentions peers.
 const MASKED_STATUS: &str = "loaded · q4_k_m · 8192 ctx · 24 layers on gpu";
+/// A peer that has not said anything for this long is treated as gone. Three
+/// missed heartbeats, so a hiccup does not make people blink in and out.
+const PRESENCE_TTL: Duration = Duration::from_secs(20);
 /// Two key events closer together than this came from the terminal, not from
 /// fingers. Pasting is the only thing that produces it.
 const PASTE_GAP: Duration = Duration::from_millis(10);
@@ -71,6 +74,12 @@ enum Feed {
         /// Set when this is a whisper; holds the other side of it.
         whisper: Option<[u8; 32]>,
     },
+}
+
+/// Someone heard from recently, and when.
+struct Live {
+    name: String,
+    at: Instant,
 }
 
 struct SessionRow {
@@ -210,7 +219,10 @@ pub struct App {
     room: Option<Arc<Mutex<OpenRoom>>>,
     net: Option<NetSession>,
     events_rx: Option<mpsc::UnboundedReceiver<NetEvent>>,
+    /// Direct gossip neighbours. Topology, shown only by /diag.
     peers: Vec<EndpointId>,
+    /// Who is actually in the room, by their own account.
+    present: HashMap<[u8; 32], Live>,
     names: HashMap<[u8; 32], String>,
     /// Where each message sits in `feed`, so a reply can find what it answers.
     by_key: HashMap<([u8; 32], u64), usize>,
@@ -268,6 +280,7 @@ impl App {
             net: None,
             events_rx: None,
             peers: Vec::new(),
+            present: HashMap::new(),
             names: HashMap::new(),
             by_key: HashMap::new(),
             ticket: None,
@@ -331,6 +344,7 @@ impl App {
         }
         self.events_rx = None;
         self.peers.clear();
+        self.present.clear();
         self.ticket = None;
         self.room = None;
         self.feed.clear();
@@ -415,11 +429,18 @@ impl App {
             .map(|(id, _)| *id)
     }
 
-    fn peer_name(&self, id: &EndpointId) -> String {
-        self.names
-            .get(id.as_bytes())
-            .cloned()
-            .unwrap_or_else(|| short_id(id))
+    /// Who has beaten recently, by name. Whoever went quiet simply ages out,
+    /// so nobody has to announce leaving.
+    fn live_now(&self) -> Vec<String> {
+        let now = Instant::now();
+        let mut names: Vec<String> = self
+            .present
+            .values()
+            .filter(|live| now.duration_since(live.at) < PRESENCE_TTL)
+            .map(|live| live.name.clone())
+            .collect();
+        names.sort_by_key(|name| name.to_lowercase());
+        names
     }
 
     /// Whether this batch of incoming text deserves a bell.
@@ -555,10 +576,28 @@ async fn run_inner(terminal: &mut Term) -> Result<()> {
                     apply_net(&mut app, ev).await;
                 }
             }
+            // Nothing arrives when a room falls silent, so the clock has to
+            // come from somewhere for people to age out of the roster.
+            _ = tokio::time::sleep(PRESENCE_TTL / 4) => sweep_presence(&mut app),
         }
     }
     app.shutdown_net().await;
     Ok(())
+}
+
+/// Drops whoever stopped beating, and says so once.
+fn sweep_presence(app: &mut App) {
+    let now = Instant::now();
+    let gone: Vec<([u8; 32], String)> = app
+        .present
+        .iter()
+        .filter(|(_, live)| now.duration_since(live.at) >= PRESENCE_TTL)
+        .map(|(id, live)| (*id, live.name.clone()))
+        .collect();
+    for (id, name) in gone {
+        app.present.remove(&id);
+        app.notice(format!("{name} left"));
+    }
 }
 
 async fn recv_net(app: &mut App) -> Option<NetEvent> {
@@ -584,21 +623,24 @@ async fn apply_net(app: &mut App, ev: NetEvent) {
     match ev {
         NetEvent::Status(s) => app.status = s,
         NetEvent::Ticket(t) => app.ticket = Some(t),
-        NetEvent::Peers(list) => {
-            let before: Vec<EndpointId> = std::mem::take(&mut app.peers);
-            for id in &list {
-                if !before.contains(id) {
-                    let who = app.peer_name(id);
-                    app.notice(format!("{who} is here"));
-                }
+        // Neighbours come and go as the overlay rearranges itself; that is
+        // not somebody entering or leaving the room, so it says nothing.
+        NetEvent::Peers(list) => app.peers = list,
+        NetEvent::Live { author, name } => {
+            app.names.insert(author, name.clone());
+            let arriving = app
+                .present
+                .insert(
+                    author,
+                    Live {
+                        name: name.clone(),
+                        at: Instant::now(),
+                    },
+                )
+                .is_none_or(|was| Instant::now().duration_since(was.at) >= PRESENCE_TTL);
+            if arriving {
+                app.notice(format!("{name} is here"));
             }
-            for id in &before {
-                if !list.contains(id) {
-                    let who = app.peer_name(id);
-                    app.notice(format!("{who} left"));
-                }
-            }
-            app.peers = list;
         }
         NetEvent::Record => {
             let before = app.consumed;
@@ -645,8 +687,9 @@ async fn sync_feed(app: &mut App) {
             Record::Meta { alias } => app.feed.push(Feed::System {
                 body: format!("session {alias}"),
             }),
-            // Not shown: it carries a key, not a message.
-            Record::Identity { .. } => {}
+            // Neither carries a message: one is a key, the other a heartbeat
+            // that was never stored to begin with.
+            Record::Identity { .. } | Record::Presence { .. } => {}
             // Only the two ends can open it. For anybody else this simply
             // produces nothing -- not even a hint that it happened.
             Record::Whisper {
@@ -1233,10 +1276,10 @@ async fn handle_command<B: Backend>(
             None => app.status = "no ticket yet — the network is still starting".into(),
         },
         "/peers" => {
-            if app.peers.is_empty() {
+            let names = app.live_now();
+            if names.is_empty() {
                 app.notice("nobody else is live right now");
             } else {
-                let names: Vec<String> = app.peers.iter().map(|id| app.peer_name(id)).collect();
                 app.notice(format!("live now: {}", names.join(", ")));
             }
         }
@@ -1326,8 +1369,9 @@ async fn diag(app: &mut App) {
         None => 0,
     };
     app.notice(format!(
-        "window #{instance} · network {} · {} live · {known} route(s) known",
+        "window #{instance} · network {} · {} in the room · {} gossip neighbour(s) · {known} route(s)",
         if app.net.is_some() { "up" } else { "down" },
+        app.live_now().len(),
         app.peers.len()
     ));
     let remembered = match app.room.clone() {
@@ -1508,13 +1552,13 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
         Screen::Chat if app.masked => format!(
             "  local-llm  {}  ctx {}/4  8192 tok{inst}",
             app.alias,
-            app.peers.len() + 1
+            app.live_now().len() + 1
         ),
         Screen::Chat => format!(
             "  local-llm  {}  {}  {} online{inst}",
             app.alias,
             app.nick,
-            app.peers.len()
+            app.live_now().len()
         ),
         Screen::Help => format!("  local-llm  {version}  keys and commands{inst}"),
         Screen::Confirm { alias, .. } => format!("  local-llm  delete {alias}{inst}"),
@@ -2595,6 +2639,61 @@ mod tests {
         // And the ruler now offers the way back.
         mouse(&mut h.app, MouseEventKind::Moved, row, 4);
         assert!(h.painted().contains("show"));
+    }
+
+    #[tokio::test]
+    async fn the_roster_counts_the_room_not_the_overlay() {
+        let mut h = Harness::new();
+        h.cmd("/new gpt-oss-20b").await;
+
+        // A gossip neighbour is topology; it says nothing about who is here.
+        apply_net(
+            &mut h.app,
+            NetEvent::Peers(vec![iroh::SecretKey::generate().public()]),
+        )
+        .await;
+        assert!(h.app.live_now().is_empty(), "a neighbour is not a person");
+        assert!(h.painted().contains("0 online"));
+
+        apply_net(
+            &mut h.app,
+            NetEvent::Live {
+                author: [9u8; 32],
+                name: "Dale".into(),
+            },
+        )
+        .await;
+        apply_net(
+            &mut h.app,
+            NetEvent::Live {
+                author: [7u8; 32],
+                name: "Ana".into(),
+            },
+        )
+        .await;
+        assert_eq!(h.app.live_now(), vec!["Ana", "Dale"]);
+        assert!(h.painted().contains("2 online"));
+
+        // Beating again is not arriving again.
+        let notices = h.transcript().matches("Dale is here").count();
+        apply_net(
+            &mut h.app,
+            NetEvent::Live {
+                author: [9u8; 32],
+                name: "Dale".into(),
+            },
+        )
+        .await;
+        assert_eq!(h.transcript().matches("Dale is here").count(), notices);
+
+        // Going quiet drops them, once.
+        h.app.present.get_mut(&[9u8; 32]).unwrap().at =
+            Instant::now() - PRESENCE_TTL - Duration::from_secs(1);
+        assert_eq!(h.app.live_now(), vec!["Ana"], "stale beats do not count");
+        sweep_presence(&mut h.app);
+        assert!(h.transcript().contains("Dale left"));
+        sweep_presence(&mut h.app);
+        assert_eq!(h.transcript().matches("Dale left").count(), 1);
     }
 
     #[tokio::test]
