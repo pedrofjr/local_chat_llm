@@ -275,7 +275,7 @@ async fn http_get(url: &str) -> Result<Vec<u8>> {
 ///
 /// Never returns on success -- the caller is expected to exit.
 #[cfg(windows)]
-pub fn install_and_relaunch(bytes: &[u8]) -> Result<()> {
+pub fn install(bytes: &[u8]) -> Result<()> {
     use std::fs;
 
     let exe = std::env::current_exe().context("cannot find our own executable")?;
@@ -293,7 +293,20 @@ pub fn install_and_relaunch(bytes: &[u8]) -> Result<()> {
         let _ = fs::rename(&retired, &exe);
         return Err(e).context("could not put the new build in place");
     }
+    Ok(())
+}
 
+#[cfg(not(windows))]
+pub fn install(_bytes: &[u8]) -> Result<()> {
+    bail!("updating is only wired up for windows")
+}
+
+/// Installs and hands over to the replacement. Used by the in-app command,
+/// where the user is sitting in front of a window that has to come back.
+#[cfg(windows)]
+pub fn install_and_relaunch(bytes: &[u8]) -> Result<()> {
+    install(bytes)?;
+    let exe = std::env::current_exe().context("cannot find our own executable")?;
     // Carries the version being left behind, so the new build can say what
     // it came from rather than just asserting it is new.
     std::process::Command::new(&exe)
@@ -329,6 +342,59 @@ pub fn sweep_previous() {
         let _ = std::fs::remove_file(exe.with_extension("old"));
         let _ = std::fs::remove_file(exe.with_extension("new"));
     }
+}
+
+/// Updates from the command line, without opening the interface.
+///
+/// `local-llm.exe update`. Useful for handing somebody a single line to run,
+/// and for updating a machine where the app is not currently open.
+///
+/// Unlike the in-app command this does **not** relaunch: whoever ran it from a
+/// terminal did not ask for a chat window to appear. It installs and says so.
+pub async fn run_cli() -> Result<()> {
+    let running = Version::current();
+    println!("local-llm {running}");
+    println!("checking for a new build…");
+
+    let manifest = fetch_manifest().await?;
+    let offered = match manifest.against(running)? {
+        Check::UpToDate(v) => {
+            println!("already on the newest build ({v})");
+            return Ok(());
+        }
+        Check::Available {
+            version,
+            manifest,
+            required,
+        } => {
+            println!("{version} is available{}", if required { " (required)" } else { "" });
+            (version, manifest)
+        }
+    };
+    let (version, manifest) = offered;
+
+    println!("downloading…");
+    let bytes = fetch_binary(&manifest).await?;
+    println!("verified {} bytes against its digest and signature", bytes.len());
+
+    // A window that is open right now keeps running the old binary -- it is
+    // already loaded in memory. Worth saying, or the next thing that happens
+    // looks like the update failed.
+    if another_window_is_open() {
+        println!("note: a local-llm window is open; it stays on {running} until reopened");
+    }
+
+    install(&bytes)?;
+    println!("installed {version} — open local-llm to use it");
+    Ok(())
+}
+
+/// True when some other process holds a window slot.
+fn another_window_is_open() -> bool {
+    // The slots are the same ones `DataDir` claims. Binding here would take
+    // one, so it is released immediately -- this is a peek, not a claim.
+    (1u8..=8)
+        .any(|n| std::net::TcpListener::bind(("127.0.0.1", 41770 + u16::from(n))).is_err())
 }
 
 /// Notes which room to reopen.
@@ -685,6 +751,32 @@ mod tests {
             None,
             "no version attached, and that is fine"
         );
+    }
+
+    /// `local-llm update` on a build that is already current must not
+    /// download or install anything.
+    ///
+    /// Ignored: needs the network and a published release.
+    ///
+    ///   cargo test the_cli_on_the_newest_build_does_nothing -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn the_cli_on_the_newest_build_does_nothing() {
+        let manifest = fetch_manifest().await.expect("manifest");
+        let published = Version::parse(&manifest.version).unwrap();
+        let running = Version::current();
+        println!("running {running}, published {published}");
+
+        match manifest.against(running).unwrap() {
+            Check::UpToDate(v) => {
+                println!("up to date at {v} — nothing would be downloaded");
+                assert!(running >= published);
+            }
+            Check::Available { version, .. } => {
+                println!("would offer {version}");
+                assert!(version > running, "must only ever move forward");
+            }
+        }
     }
 
     #[test]

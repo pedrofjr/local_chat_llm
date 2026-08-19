@@ -824,8 +824,12 @@ async fn run_inner(terminal: &mut Term) -> Result<()> {
 
     // Started by an update that just replaced us: the file we came from is
     // finally unlocked, so it can go.
+    // Always, not only after a relaunch: `local-llm update` from a terminal
+    // installs without starting anything, so the copy it replaced is still
+    // sitting there when the app is next opened by hand.
+    crate::update::sweep_previous();
+
     if crate::update::was_just_updated() {
-        crate::update::sweep_previous();
         let now = env!("CARGO_PKG_VERSION");
         let said = match crate::update::updated_from() {
             Some(before) if before != now => format!("updated — {before} to {now}"),

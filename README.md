@@ -13,7 +13,7 @@ local-llm
 A interface é toda em inglês, para combinar com a fachada de client de modelo.
 
 ```
-  local-llm  0.6.2
+  local-llm  0.6.3
 
   sessions
   >  gpt-oss-20b              ready
@@ -288,13 +288,20 @@ O exe sai em `target\release\local-llm.exe`. Alvo: &lt; 8 MB — hoje em
 curta; a próxima feature grande provavelmente exige rever o alvo.
 
 ```powershell
-Compress-Archive -Path target\release\local-llm.exe -DestinationPath local-llm-0.6.2-windows-x64.zip -Force
+Compress-Archive -Path target\release\local-llm.exe -DestinationPath local-llm-0.6.3-windows-x64.zip -Force
 ```
 
 ## Atualizar
 
 ```
 /update
+```
+
+Ou, sem abrir a interface:
+
+```powershell
+local-llm update      # baixa, confere e instala
+local-llm version
 ```
 
 Ele olha o release mais novo, compara com o que você tem e **pergunta** antes de

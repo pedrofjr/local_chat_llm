@@ -7,9 +7,47 @@ mod sys;
 mod tui;
 mod update;
 
+/// Anything the app can be asked to do without opening the interface.
+///
+/// Kept deliberately tiny. This is a chat window first; the command line is
+/// here so somebody can be handed one line to run, not so the app grows a
+/// second personality.
+const USAGE: &str = "\
+local-llm
+
+  local-llm            open the chat
+  local-llm update     install a new build and exit
+  local-llm version    print the version
+";
+
 fn main() -> anyhow::Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    rt.block_on(tui::run())
+
+    // Skips the program name, and anything the relaunch after an update adds.
+    let args: Vec<String> = std::env::args()
+        .skip(1)
+        .filter(|a| !a.starts_with(update::JUST_UPDATED))
+        .collect();
+
+    match args.first().map(String::as_str) {
+        None => rt.block_on(tui::run()),
+        Some("update") => rt.block_on(update::run_cli()),
+        Some("version" | "--version" | "-V") => {
+            println!("local-llm {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
+        Some("help" | "--help" | "-h") => {
+            print!("{USAGE}");
+            Ok(())
+        }
+        // Opening the chat on an argument we do not understand would look
+        // like the argument worked.
+        Some(other) => {
+            eprintln!("local-llm: no such command: {other}\n");
+            eprint!("{USAGE}");
+            std::process::exit(2);
+        }
+    }
 }
