@@ -119,6 +119,11 @@ pub enum NetEvent {
     /// room still looks empty, which the UI knows and the network does not.
     Searching(usize),
     Record,
+    /// How many known peers accepted a history sync this round. Zero reached
+    /// while people are demonstrably in the room means they are on a build
+    /// that speaks a different sync protocol: live messages still arrive over
+    /// gossip, history never does.
+    SyncReach { tried: usize, reached: usize },
     /// Pixels for a picture landed. The transcript already has its line; this
     /// only says it can now be opened.
     Blob,
@@ -454,8 +459,16 @@ async fn sync_loop(
             Err(_) => continue,
         };
         let me = endpoint.id();
+        // Counted because a refused connection here is invisible otherwise.
+        // Gossip runs on iroh's own ALPN and keeps delivering live messages,
+        // so a peer on an older build still *talks* -- it just never hands
+        // over history. Without this the room looks healthy and quietly is not.
+        let mut tried = 0usize;
+        let mut reached = 0usize;
         for addr in peers.into_iter().filter(|a| a.id != me) {
+            tried += 1;
             if let Ok(conn) = endpoint.connect(addr, SYNC_ALPN).await {
+                reached += 1;
                 if let Ok((mut send, mut recv)) = conn.open_bi().await {
                     if send.write_all(&req).await.is_ok() && send.finish().is_ok() {
                         if let Ok(buf) = recv.read_to_end(2 * 1024 * 1024).await {
@@ -475,6 +488,9 @@ async fn sync_loop(
                 }
                 conn.close(0u32.into(), b"ok");
             }
+        }
+        if tried > 0 {
+            let _ = events.send(NetEvent::SyncReach { tried, reached });
         }
         fetch_blobs(&endpoint, &room, &events, &known).await;
     }

@@ -309,6 +309,13 @@ pub struct App {
     /// Esc, because the alternative -- retyping `/w` every line -- is how a
     /// private sentence ends up in the room.
     whispering: Option<[u8; 32]>,
+    /// Peers that refused a history sync last round, and how many were tried.
+    /// A refusal means a different build: gossip keeps delivering live
+    /// messages, so nothing looks wrong until somebody notices the history
+    /// never arrives.
+    sync_reach: (usize, usize),
+    /// Said once per session, not once every three seconds.
+    warned_mismatch: bool,
     /// Blobs actually painted last frame. An animation nobody can see must
     /// not keep waking the loop, and scrolling a gif off the top is the
     /// commonest way for that to happen.
@@ -435,6 +442,8 @@ impl App {
             pending_expand: None,
             on_screen: Vec::new(),
             whispering: None,
+            sync_reach: (0, 0),
+            warned_mismatch: false,
         };
         app.refresh_sessions();
         Ok(app)
@@ -494,6 +503,8 @@ impl App {
         // Nobody from the last room can be whispered to from this one, and a
         // prompt still pointing at them would be a lie.
         self.whispering = None;
+        self.sync_reach = (0, 0);
+        self.warned_mismatch = false;
         self.expanded.clear();
         self.expanded_rev += 1;
         self.shots.clear();
@@ -926,6 +937,22 @@ async fn apply_net(app: &mut App, ev: NetEvent) {
                 .is_none_or(|was| Instant::now().duration_since(was.at) >= PRESENCE_TTL);
             if arriving {
                 app.notice(format!("{name} is here"));
+            }
+        }
+        NetEvent::SyncReach { tried, reached } => {
+            app.sync_reach = (tried, reached);
+            // Only worth saying when somebody is demonstrably in the room:
+            // nobody reachable and nobody present is just an empty room.
+            let people = app.live_now().len();
+            if reached == 0 && tried > 0 && people > 0 && !app.warned_mismatch {
+                app.warned_mismatch = true;
+                app.notice(format!(
+                    "{people} here, but none of them syncs history — they are on an older build.                      everyone has to update, or you each keep a partial log"
+                ));
+            }
+            if reached > 0 {
+                // Rearm, so a later mismatch is reported again.
+                app.warned_mismatch = false;
             }
         }
         // Pixels arrived for a line already on screen. Nothing to say and
@@ -2139,6 +2166,20 @@ async fn diag(app: &mut App) {
         app.live_now().len(),
         app.peers.len()
     ));
+    // The one number that explains "messages arrive but history does not":
+    // live traffic rides iroh's gossip ALPN, history rides ours, and only
+    // ours changes between versions.
+    let (tried, reached) = app.sync_reach;
+    app.notice(format!(
+        "history sync: {reached}/{tried} peer(s) answered on {} — this build is {}",
+        String::from_utf8_lossy(crate::net::SYNC_ALPN),
+        env!("CARGO_PKG_VERSION"),
+    ));
+    if tried > 0 && reached == 0 {
+        app.notice(
+            "nobody answered: they are running a different version. live messages              still come through gossip, which is why it looks like it works",
+        );
+    }
     let remembered = match app.room.clone() {
         Some(room) => crate::net::load_peers(&*room.lock().await).len(),
         None => 0,

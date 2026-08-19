@@ -190,13 +190,33 @@ fn blake3_free_sha256(bytes: &[u8]) -> Vec<u8> {
 }
 
 /// Fetches the manifest. Only ever called from `/update`.
+///
+/// "No release published yet" and "no network" look the same from a distance
+/// and mean opposite things -- one is normal, the other is a problem to chase.
+/// They are told apart here so the message on screen is actionable.
 pub async fn fetch_manifest() -> Result<Manifest> {
-    let text = http_get(MANIFEST_URL)
-        .await
-        .context("could not reach the release channel")?;
+    let text = match http_get(MANIFEST_URL).await {
+        Ok(text) => text,
+        Err(e) if e.downcast_ref::<NoRelease>().is_some() => {
+            bail!("no release published yet — nothing to update to")
+        }
+        Err(e) => return Err(e).context("could not reach github"),
+    };
     let text = String::from_utf8(text).context("release manifest is not text")?;
     Manifest::parse(&text)
 }
+
+/// The channel answered, and said there is nothing there.
+#[derive(Debug)]
+struct NoRelease;
+
+impl std::fmt::Display for NoRelease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "no release published")
+    }
+}
+
+impl std::error::Error for NoRelease {}
 
 /// Downloads the binary a manifest points at and checks it.
 ///
@@ -227,7 +247,13 @@ async fn http_get(url: &str) -> Result<Vec<u8>> {
         .https_only(true)
         .build()
         .context("could not start the http client")?;
-    let response = client.get(url).send().await?.error_for_status()?;
+    let response = client.get(url).send().await?;
+    // A repo with no releases answers 404 for `releases/latest/...`. That is
+    // an empty shelf, not a broken one.
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Err(NoRelease.into());
+    }
+    let response = response.error_for_status()?;
     if let Some(len) = response.content_length() {
         if len > MAX {
             bail!("release is {len} bytes, refusing to download that");

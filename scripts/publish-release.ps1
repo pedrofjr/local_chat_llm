@@ -134,10 +134,23 @@ git push origin $tag 2>$null
 if ($LASTEXITCODE -ne 0) { git push upstream $tag }
 
 Step 'creating the release'
+# As notas seguem o idioma do README (portugues). A interface do app fica em
+# ingles, para combinar com a fachada de client de modelo -- sao publicos
+# diferentes: o release e lido por quem instala, a UI por quem passa atras.
+$notes = @"
+Rode ``/update`` numa versao anterior para instalar esta.
+
+O download passa pelo proprio app, entao o arquivo nao recebe o carimbo de
+"veio da internet" e o SmartScreen nao entra na frente. O binario e conferido
+pelo sha256 e pela assinatura antes de substituir o que esta rodando.
+
+Todos precisam estar na mesma versao: mensagens ao vivo passam entre versoes
+diferentes, mas o historico nao sincroniza.
+"@
 gh release create $tag $exe $manifestPath `
     --repo pedrofjr/local_chat_llm `
     --title "local-llm $version" `
-    --notes "Run ``/update`` in an older build to install this one."
+    --notes $notes
 if ($LASTEXITCODE -ne 0) { throw 'gh release create failed' }
 
 Step "done - $tag is live, /update will find it"
