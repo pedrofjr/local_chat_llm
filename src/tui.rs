@@ -957,19 +957,19 @@ async fn sync_feed(app: &mut App) {
             Record::Whisper {
                 author, seq, ts, ..
             } => {
-                let Some((name, body, them)) = room.open_whisper(rec) else {
+                let Some(opened) = room.open_whisper(rec) else {
                     continue;
                 };
                 app.by_key.insert((*author, *seq), app.feed.len());
                 app.feed.push(Feed::Msg {
                     author: *author,
                     seq: *seq,
-                    name,
+                    name: opened.name,
                     mine: room.is_mine(rec),
-                    body,
+                    body: opened.body,
                     ts: *ts,
-                    reply_to: None,
-                    whisper: Some(them),
+                    reply_to: opened.reply_to,
+                    whisper: Some(opened.them),
                     image: None,
                 });
             }
@@ -2424,9 +2424,10 @@ async fn whisper_cmd(app: &mut App, line: &str) {
     }
     let text = text.to_string();
     let Some(room) = app.room.clone() else { return };
+    let reply = app.replying;
     let rec = {
         let mut room = room.lock().await;
-        match room.compose_whisper(target, text.to_string()) {
+        match room.compose_whisper(target, text.to_string(), reply) {
             Ok(rec) => rec,
             Err(e) => {
                 app.status = format!("whisper not sent: {e}");
@@ -2434,6 +2435,11 @@ async fn whisper_cmd(app: &mut App, line: &str) {
             }
         }
     };
+    // Every other way of sending clears this. Without it the reply stayed
+    // armed after a whisper and quietly attached itself to the next ordinary
+    // message instead.
+    app.replying = None;
+    app.picked = None;
     app.follow = true;
     app.unread = 0;
     sync_feed(app).await;
@@ -3994,6 +4000,97 @@ mod tests {
         h.app.input.insert_str("/w dia");
         h.press(KeyCode::Tab).await;
         assert_eq!(h.app.input.text, "/w Diamante ");
+    }
+
+    /// Publishes a made-up peer's whisper key into the open room, so a
+    /// whisper to them actually composes instead of failing for want of a key.
+    async fn peer_who_can_be_whispered_to(app: &mut App, nick: &str) -> [u8; 32] {
+        let secret = iroh::SecretKey::generate();
+        let author = *secret.public().as_bytes();
+        let x_pub = crate::crypto::whisper_public(&crate::crypto::whisper_secret(
+            &secret.to_bytes(),
+        ));
+        let sig = secret.sign(&crate::room::identity_payload(&author, &x_pub));
+        let identity = Record::Identity {
+            author,
+            x_pub,
+            sig: sig.to_bytes().to_vec(),
+        };
+        let room = app.room.clone().expect("a room has to be open");
+        room.lock().await.ingest(identity).unwrap();
+        app.names.insert(author, nick.into());
+        author
+    }
+
+    #[tokio::test]
+    async fn a_whisper_carries_the_reply_and_does_not_leave_it_armed() {
+        let mut h = Harness::new();
+        h.cmd("/new gpt-oss-20b").await;
+        let them = peer_who_can_be_whispered_to(&mut h.app, "Diamante").await;
+        push_peer(&mut h.app, them, 1, "Diamante", "alguem viu o relatorio?");
+        let answered = (them, 1u64);
+
+        // Point at the message, then answer it privately.
+        let last = h.app.feed.len() - 1;
+        arm_reply(&mut h.app, last);
+        assert_eq!(h.app.replying, Some(answered));
+        h.cmd("/w Diamante ta comigo").await;
+
+        // The quote reaches the whisper that was actually sent.
+        match h.app.feed.last() {
+            Some(Feed::Msg {
+                body,
+                reply_to,
+                whisper: Some(_),
+                ..
+            }) => {
+                assert_eq!(body, "ta comigo");
+                assert_eq!(
+                    *reply_to,
+                    Some(answered),
+                    "the whisper should quote what it answered"
+                );
+            }
+            _ => panic!("expected a whisper, status was {:?}", h.app.status),
+        }
+
+        // And it is cleared afterwards, like every other kind of send. Leaving
+        // it armed made the *next* ordinary message quote something at random,
+        // which is what made this look broken rather than merely missing.
+        assert_eq!(h.app.replying, None, "the reply must not stay armed");
+
+        send(&mut h.app, "assunto totalmente diferente".into()).await;
+        match h.app.feed.last() {
+            Some(Feed::Msg {
+                reply_to, body, ..
+            }) => {
+                assert_eq!(body, "assunto totalmente diferente");
+                assert_eq!(*reply_to, None, "a stale reply leaked into the next message");
+            }
+            _ => panic!("expected a message"),
+        }
+    }
+
+    /// The quote lives inside the ciphertext, so the disguise -- which drops
+    /// whispers entirely -- must not put it back on screen.
+    #[tokio::test]
+    async fn a_quoted_whisper_still_vanishes_under_the_disguise() {
+        let mut h = Harness::new();
+        h.cmd("/new gpt-oss-20b").await;
+        let them = peer_who_can_be_whispered_to(&mut h.app, "Diamante").await;
+        push_peer(&mut h.app, them, 1, "Diamante", "o relatorio do Pedro");
+        let last = h.app.feed.len() - 1;
+        arm_reply(&mut h.app, last);
+        h.cmd("/w Diamante ta comigo").await;
+
+        h.app.masked = true;
+        let masked = h.painted();
+        assert!(!masked.contains("ta comigo"), "whisper text leaked");
+        assert!(!masked.contains("Diamante"), "whisper name leaked");
+        assert!(
+            !masked.contains(QUOTE_MARK),
+            "the quote line leaked through the disguise"
+        );
     }
 
     #[tokio::test]

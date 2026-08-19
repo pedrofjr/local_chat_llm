@@ -6,10 +6,33 @@ use serde::{Deserialize, Serialize};
 
 /// What actually travels inside a whisper. The name goes in the ciphertext so
 /// bystanders learn who talked to whom, but not under which name.
+///
+/// `reply_to` is in here rather than on the record for the same reason:
+/// outside, it would tell the whole room that you answered that particular
+/// message privately, which gives away most of what a whisper is for.
 #[derive(Serialize, Deserialize)]
 struct WhisperBody {
     name: String,
     body: String,
+    reply_to: Option<([u8; 32], u64)>,
+}
+
+/// Whispers written before answering was possible. postcard is not
+/// self-describing, so a body with one fewer field cannot be told apart by
+/// inspection -- it is simply tried second.
+#[derive(Serialize, Deserialize)]
+struct WhisperBodyV1 {
+    name: String,
+    body: String,
+}
+
+/// An opened whisper.
+pub struct OpenedWhisper {
+    pub name: String,
+    pub body: String,
+    /// The other end of the conversation, whoever we are.
+    pub them: [u8; 32],
+    pub reply_to: Option<([u8; 32], u64)>,
 }
 
 pub struct OpenRoom {
@@ -245,10 +268,16 @@ impl OpenRoom {
         Ok(whisper_key(&secret, &their_pub, &self.author, them))
     }
 
-    pub fn compose_whisper(&mut self, to: [u8; 32], body: String) -> Result<Record> {
+    pub fn compose_whisper(
+        &mut self,
+        to: [u8; 32],
+        body: String,
+        reply_to: Option<([u8; 32], u64)>,
+    ) -> Result<Record> {
         let sealed = self.pair_key(&to)?.seal(&postcard::to_stdvec(&WhisperBody {
             name: self.nick.clone(),
             body,
+            reply_to,
         })?)?;
         let seq = self.log.next_seq_for(&self.author);
         let ts = now_ts();
@@ -270,7 +299,7 @@ impl OpenRoom {
     /// Opens a whisper we are a party to. Returns the sender's name, the text,
     /// and the person on the other end. Anything else answers None, which is
     /// exactly what a bystander gets.
-    pub fn open_whisper(&self, rec: &Record) -> Option<(String, String, [u8; 32])> {
+    pub fn open_whisper(&self, rec: &Record) -> Option<OpenedWhisper> {
         let Record::Whisper {
             author, to, ct, ..
         } = rec
@@ -286,8 +315,24 @@ impl OpenRoom {
             return None;
         };
         let plain = self.pair_key(&them).ok()?.open(ct).ok()?;
-        let opened: WhisperBody = postcard::from_bytes(&plain).ok()?;
-        Some((opened.name, opened.body, them))
+        // Current format first; anything written before whispers could answer
+        // a message falls back to the older body rather than becoming
+        // unreadable.
+        if let Ok(opened) = postcard::from_bytes::<WhisperBody>(&plain) {
+            return Some(OpenedWhisper {
+                name: opened.name,
+                body: opened.body,
+                them,
+                reply_to: opened.reply_to,
+            });
+        }
+        let old: WhisperBodyV1 = postcard::from_bytes(&plain).ok()?;
+        Some(OpenedWhisper {
+            name: old.name,
+            body: old.body,
+            them,
+            reply_to: None,
+        })
     }
 
     /// Says we are here, under the name we are using, and where to find us.
@@ -547,7 +592,9 @@ mod tests {
             peer.ingest(ib.clone()).unwrap();
         }
 
-        let sealed = a.compose_whisper(b.author, "o chefe vem quinta".into()).unwrap();
+        let sealed = a
+            .compose_whisper(b.author, "o chefe vem quinta".into(), None)
+            .unwrap();
         assert!(
             !format!("{sealed:?}").contains("chefe"),
             "the plaintext must not survive anywhere in the record"
@@ -556,10 +603,10 @@ mod tests {
         b.ingest(sealed.clone()).unwrap();
         c.ingest(sealed.clone()).unwrap();
 
-        let (name, text, other) = b.open_whisper(&sealed).expect("the recipient reads it");
-        assert_eq!(text, "o chefe vem quinta");
-        assert_eq!(other, a.author);
-        assert_eq!(name, a.nick);
+        let opened = b.open_whisper(&sealed).expect("the recipient reads it");
+        assert_eq!(opened.body, "o chefe vem quinta");
+        assert_eq!(opened.them, a.author);
+        assert_eq!(opened.name, a.nick);
 
         // A third person holds the same room key and still gets nothing.
         assert!(
@@ -568,8 +615,105 @@ mod tests {
         );
 
         // And the sender can reread what they sent.
-        let (_, mine, _) = a.open_whisper(&sealed).expect("sender rereads it");
-        assert_eq!(mine, "o chefe vem quinta");
+        let mine = a.open_whisper(&sealed).expect("sender rereads it");
+        assert_eq!(mine.body, "o chefe vem quinta");
+    }
+
+    #[test]
+    fn a_whisper_can_answer_a_message_without_telling_the_room() {
+        let pin = Pin::parse("7K2M-9QXP").unwrap();
+        let (ta, tb, tc) = (
+            TempDir::new().unwrap(),
+            TempDir::new().unwrap(),
+            TempDir::new().unwrap(),
+        );
+        let (mut a, mut b, mut c) = (open_at(&ta, &pin), open_at(&tb, &pin), open_at(&tc, &pin));
+        let ia = a.announce_identity().unwrap().unwrap();
+        let ib = b.announce_identity().unwrap().unwrap();
+        for peer in [&mut b, &mut c] {
+            peer.ingest(ia.clone()).unwrap();
+        }
+        for peer in [&mut a, &mut c] {
+            peer.ingest(ib.clone()).unwrap();
+        }
+
+        // Something said out loud, then answered in private.
+        let aloud = c.compose("alguem viu o relatorio?".into(), None).unwrap();
+        for peer in [&mut a, &mut b] {
+            peer.ingest(aloud.clone()).unwrap();
+        }
+        let Some(answered) = aloud.chat_key() else {
+            panic!("expected a message");
+        };
+
+        let sealed = a
+            .compose_whisper(b.author, "ta comigo, nao fala nada".into(), Some(answered))
+            .unwrap();
+        b.ingest(sealed.clone()).unwrap();
+        c.ingest(sealed.clone()).unwrap();
+
+        let opened = b.open_whisper(&sealed).expect("the recipient reads it");
+        assert_eq!(opened.reply_to, Some(answered), "the quote has to survive");
+        assert_eq!(opened.body, "ta comigo, nao fala nada");
+
+        // The whole point of putting it inside the ciphertext: the room holds
+        // the record and still cannot tell which message was answered.
+        let Record::Whisper { ct, .. } = &sealed else {
+            panic!("expected a whisper");
+        };
+        assert!(
+            !ct.windows(32).any(|w| w == answered.0),
+            "who was answered must not be readable off the record"
+        );
+        assert!(
+            c.open_whisper(&sealed).is_none(),
+            "a bystander must still get nothing"
+        );
+
+        // The sender rereads their own with the quote intact.
+        assert_eq!(
+            a.open_whisper(&sealed).expect("sender rereads").reply_to,
+            Some(answered)
+        );
+    }
+
+    #[test]
+    fn whispers_written_before_answering_existed_still_open() {
+        let pin = Pin::parse("7K2M-9QXP").unwrap();
+        let (ta, tb) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let (mut a, mut b) = (open_at(&ta, &pin), open_at(&tb, &pin));
+        let ia = a.announce_identity().unwrap().unwrap();
+        let ib = b.announce_identity().unwrap().unwrap();
+        b.ingest(ia).unwrap();
+        a.ingest(ib).unwrap();
+
+        // Hand-built in the old two-field shape, exactly as 0.4.0 and earlier
+        // wrote it. postcard is positional, so nothing but the byte layout
+        // tells the two apart.
+        let legacy = postcard::to_stdvec(&WhisperBodyV1 {
+            name: "Pedro".into(),
+            body: "isso foi escrito antes".into(),
+        })
+        .unwrap();
+        let ct = a.pair_key(&b.author).unwrap().seal(&legacy).unwrap();
+        let seq = a.log.next_seq_for(&a.author);
+        let ts = now_ts();
+        let sig = a
+            .secret
+            .sign(&whisper_payload(&a.author, seq, ts, &b.author, &ct));
+        let rec = Record::Whisper {
+            author: a.author,
+            seq,
+            ts,
+            to: b.author,
+            ct,
+            sig: sig.to_bytes().to_vec(),
+        };
+
+        let opened = b.open_whisper(&rec).expect("an old whisper must still open");
+        assert_eq!(opened.body, "isso foi escrito antes");
+        assert_eq!(opened.name, "Pedro");
+        assert_eq!(opened.reply_to, None, "it never had a quote to begin with");
     }
 
     #[test]
@@ -632,7 +776,7 @@ mod tests {
         let (ta, tb) = (TempDir::new().unwrap(), TempDir::new().unwrap());
         let (mut a, b) = (open_at(&ta, &pin), open_at(&tb, &pin));
         // b never announced as far as a is concerned.
-        assert!(a.compose_whisper(b.author, "oi".into()).is_err());
+        assert!(a.compose_whisper(b.author, "oi".into(), None).is_err());
     }
 
     #[test]

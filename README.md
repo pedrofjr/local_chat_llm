@@ -96,6 +96,11 @@ guardam bytes ilegíveis mesmo tendo a chave da sala. O que **vaza** é o
 metadado: quem leu o log vê que houve um sussurro, de quem para quem e quando.
 Só o conteúdo é protegido.
 
+Sussurro também responde: marque a mensagem com `Ctrl+R` (ou o `↩ reply`) e
+mande o `/w` normalmente. A citação viaja **dentro** do texto cifrado, então
+os outros continuam sem saber sequer que você respondeu àquela mensagem — de
+fora, o metadado é o mesmo de qualquer sussurro.
+
 No `F12` os sussurros **somem da tela** por inteiro, e as citações também —
 elas carregariam um nome real através do disfarce.
 
