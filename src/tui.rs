@@ -1886,7 +1886,21 @@ async fn send_image(app: &mut App, raw: Vec<u8>) {
         }
     };
     let Some(room) = app.room.clone() else { return };
-    let reply = app.replying;
+    // A picture always goes to the room, so a quoted whisper cannot come with
+    // it -- same reasoning as `send`. Here the quote is dropped rather than
+    // the send refused: there is no way to hand a picture back to the input,
+    // and refusing would mean snipping it again.
+    let mut reply = app.replying;
+    let mut dropped = None;
+    if let Some(other) = whisper_being_answered(app) {
+        dropped = Some(
+            app.names
+                .get(&other)
+                .cloned()
+                .unwrap_or_else(|| "them".into()),
+        );
+        reply = None;
+    }
     let rec = {
         let mut room = room.lock().await;
         match room.compose_image(
@@ -1910,17 +1924,23 @@ async fn send_image(app: &mut App, raw: Vec<u8>) {
     app.unread = 0;
     sync_feed(app).await;
     let size = format!("{}x{}", ready.w, ready.h);
+    let note = dropped
+        .map(|who| format!(" — quote dropped, only {who} can read that whisper"))
+        .unwrap_or_default();
     match &app.net {
         Some(net) => {
             // Only the description goes out over gossip; the pixels wait for
             // whoever wants them to ask on their own stream.
             if let Err(e) = net.broadcast(&rec).await {
-                app.status = format!("not delivered: {e}");
+                app.status = format!("not delivered: {e}{note}");
             } else {
-                app.status = format!("sent {size}, {}", human_bytes(ready.bytes.len() as u32));
+                app.status = format!(
+                    "sent {size}, {}{note}",
+                    human_bytes(ready.bytes.len() as u32)
+                );
             }
         }
-        None => app.status = format!("offline — {size} saved here, not sent"),
+        None => app.status = format!("offline — {size} saved here, not sent{note}"),
     }
 }
 
@@ -2456,7 +2476,24 @@ async fn whisper_cmd(app: &mut App, line: &str) {
     }
     let text = text.to_string();
     let Some(room) = app.room.clone() else { return };
-    let reply = app.replying;
+    // A quoted whisper can only travel back to the person it was with. Sent
+    // to anyone else it is the same trap as answering one out loud: they
+    // cannot open the quoted whisper, so the context exists only on our
+    // screen. Dropped rather than refused -- the message itself is fine, and
+    // the sender is told so they can paste what matters by hand.
+    let mut reply = app.replying;
+    let mut dropped = None;
+    if let Some(other) = whisper_being_answered(app) {
+        if other != target {
+            dropped = Some(
+                app.names
+                    .get(&other)
+                    .cloned()
+                    .unwrap_or_else(|| "them".into()),
+            );
+            reply = None;
+        }
+    }
     let rec = {
         let mut room = room.lock().await;
         match room.compose_whisper(target, text.to_string(), reply) {
@@ -2475,13 +2512,20 @@ async fn whisper_cmd(app: &mut App, line: &str) {
     app.follow = true;
     app.unread = 0;
     sync_feed(app).await;
+    // The dropped quote is worth saying however the send went: it changed
+    // what the other side will see.
+    let note = dropped
+        .map(|who| format!(" — quote dropped, only {who} can read that whisper"))
+        .unwrap_or_default();
     match &app.net {
         Some(net) => {
             if let Err(e) = net.broadcast(&rec).await {
-                app.status = format!("whisper saved but not delivered: {e}");
+                app.status = format!("whisper saved but not delivered: {e}{note}");
+            } else if !note.is_empty() {
+                app.status = format!("sent{note}");
             }
         }
-        None => app.status = "offline - the whisper is saved, not sent".into(),
+        None => app.status = format!("offline - the whisper is saved, not sent{note}"),
     }
 }
 
@@ -4233,6 +4277,110 @@ mod tests {
         // Esc drops the quote, and the same text then goes to the room.
         h.press(KeyCode::Esc).await;
         assert!(h.app.replying.is_none(), "esc has to release the quote");
+    }
+
+    /// The same trap one step further in: quoting Ana's whisper into a whisper
+    /// meant for Bia. Bia cannot open Ana's whisper either, so she gets the
+    /// placeholder while we sit looking at the full text.
+    #[tokio::test]
+    async fn a_whisper_quote_cannot_be_carried_to_a_third_person() {
+        let mut h = Harness::new();
+        h.cmd("/new gpt-oss-20b").await;
+        let ana = peer_who_can_be_whispered_to(&mut h.app, "Ana").await;
+        let bia = peer_who_can_be_whispered_to(&mut h.app, "Bia").await;
+
+        // A whisper Ana sent us.
+        let seq = 1u64;
+        h.app.by_key.insert((ana, seq), h.app.feed.len());
+        h.app.feed.push(Feed::Msg {
+            author: ana,
+            seq,
+            name: "Ana".into(),
+            mine: false,
+            body: "o chefe vai demitir o Carlos".into(),
+            ts: now_ts(),
+            reply_to: None,
+            whisper: Some(ana),
+            image: None,
+        });
+        let last = h.app.feed.len() - 1;
+        arm_reply(&mut h.app, last);
+
+        // Passing it along to Bia must not carry the quote.
+        h.cmd("/w Bia olha o que a Ana falou").await;
+        match h.app.feed.last() {
+            Some(Feed::Msg {
+                reply_to,
+                whisper: Some(other),
+                ..
+            }) => {
+                assert_eq!(*other, bia, "should have gone to Bia");
+                assert_eq!(
+                    *reply_to, None,
+                    "Bia cannot open Ana's whisper, so quoting it at her only \
+                     shows *us* a context she does not have"
+                );
+            }
+            _ => panic!("expected a whisper, status {:?}", h.app.status),
+        }
+        assert!(
+            h.app.status.contains("Ana"),
+            "and it has to say the quote was dropped and why, got {:?}",
+            h.app.status
+        );
+    }
+
+    /// A picture always goes to the room, so a whisper quote must not ride
+    /// along with it either.
+    #[tokio::test]
+    async fn a_picture_cannot_carry_a_whisper_quote_to_the_room() {
+        let mut h = Harness::new();
+        h.cmd("/new gpt-oss-20b").await;
+        let ana = peer_who_can_be_whispered_to(&mut h.app, "Ana").await;
+
+        h.app.by_key.insert((ana, 1), h.app.feed.len());
+        h.app.feed.push(Feed::Msg {
+            author: ana,
+            seq: 1,
+            name: "Ana".into(),
+            mine: false,
+            body: "o chefe vai demitir o Carlos".into(),
+            ts: now_ts(),
+            reply_to: None,
+            whisper: Some(ana),
+            image: None,
+        });
+        let last = h.app.feed.len() - 1;
+        arm_reply(&mut h.app, last);
+
+        // A tiny real PNG, through the same path a pasted screenshot takes.
+        let mut img = image::RgbaImage::new(8, 8);
+        for px in img.pixels_mut() {
+            *px = image::Rgba([10, 20, 30, 255]);
+        }
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        send_image(&mut h.app, png.into_inner()).await;
+
+        match h.app.feed.last() {
+            Some(Feed::Msg {
+                reply_to,
+                image: Some(_),
+                ..
+            }) => assert_eq!(
+                *reply_to, None,
+                "a picture goes to the room; a whisper quote on it would show \
+                 the context to us alone"
+            ),
+            _ => panic!("expected a picture, status {:?}", h.app.status),
+        }
+        assert!(
+            h.app.status.contains("quote dropped"),
+            "and it has to say so, got {:?}",
+            h.app.status
+        );
     }
 
     /// The quote lives inside the ciphertext, so the disguise -- which drops

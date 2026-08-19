@@ -111,6 +111,27 @@ inverso — **você** veria a citação inteira na sua tela, colada numa mensage
 pública, e escreveria a frase seguinte como se todo mundo tivesse aquele
 contexto. É assim que o sussurro vaza pelas suas próprias palavras.
 
+A regra completa, para cada combinação:
+
+| você marcou | e mandou | o que acontece |
+|---|---|---|
+| mensagem da sala | mensagem da sala | cita normal; todos leem a citação |
+| mensagem da sala | `/w Fulano` | cita normal; Fulano lê, a sala nem vê o sussurro |
+| mensagem da sala | imagem | cita normal |
+| **sussurro do Fulano** | mensagem da sala | **não sai.** Volta como `/w Fulano …` |
+| **sussurro do Fulano** | `/w Fulano` | cita; só vocês dois leem |
+| **sussurro do Fulano** | `/w Beltrano` | vai **sem** a citação, e avisa |
+| **sussurro do Fulano** | imagem | vai **sem** a citação, e avisa |
+
+As três últimas linhas são a mesma regra dita de três jeitos: **a citação de
+um sussurro só existe entre as duas pessoas daquele sussurro.** Para qualquer
+outro destino ela é removida, porque quem recebe não conseguiria abri-la — e
+o resultado seria de novo um contexto que só você enxerga.
+
+Onde dá para devolver o que você digitou, o app recusa e devolve; onde não dá
+(imagem, que teria de ser recortada de novo), ele manda sem a citação e diz
+que fez isso.
+
 No `F12` os sussurros **somem da tela** por inteiro, e as citações também —
 elas carregariam um nome real através do disfarce.
 
