@@ -59,11 +59,15 @@ Step 'cargo clippy'
 cargo clippy --all-targets -- -D warnings
 if ($LASTEXITCODE -ne 0) { throw 'clippy failed' }
 
-Step 'cargo build --release'
+# Windows will not let cargo replace an exe that is running, and somebody is
+# usually using the app while a release is being cut. An alternative target
+# directory sidesteps that without asking anyone to close anything.
+$target = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $repo 'target' }
+Step "building into $target"
 cargo build --release
 if ($LASTEXITCODE -ne 0) { throw 'build failed' }
 
-$exe = Join-Path $repo 'target\release\local-llm.exe'
+$exe = Join-Path $target 'release\local-llm.exe'
 if (-not (Test-Path $exe)) { throw "no exe at $exe" }
 $size = [math]::Round((Get-Item $exe).Length / 1MB, 2)
 Step "exe is $size MB"
@@ -72,7 +76,7 @@ Step "exe is $size MB"
 # Python does the Ed25519 because it is already here; the app verifies the
 # result with iroh's implementation, which is the same standard curve.
 Step 'signing'
-$out = Join-Path $repo 'target\release'
+$out = Join-Path $target 'release'
 $py = @'
 import sys, hashlib
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
