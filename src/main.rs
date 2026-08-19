@@ -5,6 +5,7 @@ mod room;
 mod store;
 mod sys;
 mod tui;
+mod update;
 
 fn main() -> anyhow::Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()

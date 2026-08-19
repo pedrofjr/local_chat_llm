@@ -24,6 +24,13 @@ iroh-gossip = "0.101"
 iroh-mdns-address-lookup = "0.4"
 postcard = { version = "1", default-features = false, features = ["alloc", "use-std"] }
 rand = "0.8"
+# Already compiled in the tree via iroh. Taken directly so /update can
+# fetch a release itself -- a file written by a program carries no Mark
+# of the Web, which is what keeps SmartScreen out of the way.
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2"] }
+# Already in the tree via iroh's TLS. Taken directly for the one sha256
+# the project needs: the digest published alongside a release.
+ring = "0.17"
 ratatui = "0.30"
 # Draws pictures through whatever the terminal speaks: sixel on Windows
 # Terminal 1.22+, unicode halfblocks everywhere else. No native C library

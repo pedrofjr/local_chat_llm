@@ -1,4 +1,4 @@
-use crate::crypto::{color_for, role_for, topic_id, Pin};
+use crate::crypto::{color_for, role_for, topic_id, Pin, topic_hex};
 use crate::net::{parse_ticket, NetEvent, NetSession, Presence};
 use crate::room::OpenRoom;
 use crate::store::{now_ts, DataDir, ImageKind, ImageProto, Notify, Record, Settings};
@@ -56,6 +56,13 @@ enum Screen {
     /// pushed it out of view within seconds.
     Help,
     Confirm { alias: String, topic: [u8; 32] },
+    /// A new build was found and is waiting for a yes. Holds the verified
+    /// manifest so the answer does not have to go looking again.
+    Upgrade {
+        version: String,
+        manifest: Box<crate::update::Manifest>,
+        required: bool,
+    },
 }
 
 /// One rendered entry. Notices are local-only (never written to the log) and
@@ -794,6 +801,15 @@ fn spawn_input_thread() -> mpsc::UnboundedReceiver<(Event, bool)> {
 
 async fn run_inner(terminal: &mut Term) -> Result<()> {
     let mut app = App::new()?;
+
+    // Started by an update that just replaced us: the file we came from is
+    // finally unlocked, so it can go.
+    if std::env::args().any(|a| a == crate::update::JUST_UPDATED) {
+        crate::update::sweep_previous();
+        app.status = format!("updated to {}", env!("CARGO_PKG_VERSION"));
+        resume_room(&mut app, terminal).await;
+    }
+
     let mut events = spawn_input_thread();
     loop {
         // Frames advance before the draw, so what is painted is what is due.
@@ -1122,6 +1138,21 @@ async fn handle_key<B: Backend>(
             }
             return Ok(false);
         }
+        Screen::Upgrade {
+            version, manifest, ..
+        } => {
+            if key.code == KeyCode::Enter {
+                // `true` means the replacement is running and this process
+                // should stand down.
+                return install_update(app, &version, &manifest, term).await;
+            }
+            app.close_overlay();
+            app.status = format!(
+                "staying on {} — /update when you want it",
+                env!("CARGO_PKG_VERSION")
+            );
+            return Ok(false);
+        }
         _ => {}
     }
     if key.code == KeyCode::F(1) {
@@ -1135,7 +1166,7 @@ async fn handle_key<B: Backend>(
         Screen::Home => handle_home(app, key, term).await,
         Screen::Unlock { alias, topic } => handle_unlock(app, key, term, &alias, topic).await,
         Screen::Chat => handle_chat(app, key, term, pasting).await,
-        Screen::Help | Screen::Confirm { .. } => Ok(false),
+        Screen::Help | Screen::Confirm { .. } | Screen::Upgrade { .. } => Ok(false),
     }
 }
 
@@ -1841,6 +1872,7 @@ async fn handle_command<B: Backend>(
         "/w" | "/whisper" => whisper_cmd(app, &line).await,
         "/paste" => paste_cmd(app, &rest)?,
         "/img" | "/image" => image_cmd(app, &line).await,
+        "/update" => check_for_update(app, term).await,
         "/notify" | "/mute" => notify_cmd(app, &rest)?,
         "/diag" => diag(app).await,
         "/help" | "/?" => app.screen = Screen::Help,
@@ -1992,6 +2024,86 @@ async fn send_image(app: &mut App, raw: Vec<u8>) {
     }
 }
 
+/// Asks the release channel whether there is something newer.
+///
+/// The only place in the program that talks to anything outside the LAN, and
+/// only when somebody types `/update`. Anything that goes wrong -- no network,
+/// github down, a manifest we do not trust -- is reported and dropped; the app
+/// keeps working offline exactly as before.
+async fn check_for_update<B: Backend>(app: &mut App, term: &mut Terminal<B>) {
+    app.status = "checking for a new build…".into();
+    let _ = term.draw(|f| draw(f, app));
+
+    let manifest = match crate::update::fetch_manifest().await {
+        Ok(manifest) => manifest,
+        Err(e) => {
+            app.status = format!("could not check: {e}");
+            return;
+        }
+    };
+    match manifest.against(crate::update::Version::current()) {
+        Ok(crate::update::Check::UpToDate(running)) => {
+            app.status = format!("already on the newest build ({running})");
+        }
+        Ok(crate::update::Check::Available {
+            version,
+            manifest,
+            required,
+        }) => {
+            app.screen = Screen::Upgrade {
+                version: version.to_string(),
+                manifest,
+                required,
+            };
+        }
+        Err(e) => app.status = format!("could not read the release: {e}"),
+    }
+}
+
+/// Downloads, verifies and installs, then hands over to the new build.
+///
+/// Answers `true` when the replacement is running and this process should
+/// exit. The open room is noted first -- by topic only, never the key -- so
+/// the new build comes back to it.
+async fn install_update<B: Backend>(
+    app: &mut App,
+    version: &str,
+    manifest: &crate::update::Manifest,
+    term: &mut Terminal<B>,
+) -> Result<bool> {
+    app.status = format!("downloading {version}…");
+    let _ = term.draw(|f| draw(f, app));
+
+    // Nothing touches the disk until both the digest and the release
+    // signature hold.
+    let bytes = match crate::update::fetch_binary(manifest).await {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            app.close_overlay();
+            app.status = format!("update refused: {e}");
+            return Ok(false);
+        }
+    };
+
+    let resume = match &app.room {
+        Some(room) => Some(topic_hex(&topic_id(&room.lock().await.pin))),
+        None => None,
+    };
+
+    app.status = "installing…".into();
+    let _ = term.draw(|f| draw(f, app));
+    app.shutdown_net().await;
+
+    match crate::update::install_and_relaunch(&bytes, resume.as_deref()) {
+        Ok(()) => Ok(true),
+        Err(e) => {
+            app.close_overlay();
+            app.status = format!("could not install: {e}");
+            Ok(false)
+        }
+    }
+}
+
 /// Wiping history is irreversible and there is no second copy. Naming the
 /// session goes straight through; anything else stops on a confirm screen.
 async fn forget(app: &mut App, arg: &str) -> Result<bool> {
@@ -2040,6 +2152,35 @@ async fn diag(app: &mut App) {
             "no peers: check the windows firewall prompt was allowed on private networks, and that both machines are on the same subnet. /ticket works around mdns.",
         );
     }
+}
+
+/// Reopens the room the app was in before an update restarted it.
+///
+/// Only rooms whose key is remembered on this machine come back by themselves.
+/// A locked one stops at its unlock screen rather than being skipped, so the
+/// restart does not quietly drop somebody out of the conversation.
+async fn resume_room<B: Backend>(app: &mut App, term: &mut Terminal<B>) {
+    let Some(topic_hex_wanted) = crate::update::take_resume() else {
+        return;
+    };
+    let Some(row) = app
+        .sessions
+        .iter()
+        .find(|row| topic_hex(&row.topic) == topic_hex_wanted)
+        .map(|row| (row.alias.clone(), row.topic, row.remembered))
+    else {
+        return;
+    };
+    let (alias, topic, remembered) = row;
+    if remembered {
+        if let Some(pin) = app.dir.recall_pin(&topic) {
+            let _ = term.draw(|f| draw(f, app));
+            open_room(app, pin, Some(&alias), Vec::new(), false).await;
+            return;
+        }
+    }
+    app.screen = Screen::Unlock { alias, topic };
+    app.status = "back after the update — enter the key".into();
 }
 
 async fn open_room(
@@ -2187,6 +2328,9 @@ fn draw(f: &mut Frame, app: &mut App) {
         Screen::Chat => draw_chat(f, chunks[1], app),
         Screen::Help => draw_help(f, chunks[1]),
         Screen::Confirm { alias, .. } => draw_confirm(f, chunks[1], &alias),
+        Screen::Upgrade {
+            version, required, ..
+        } => draw_upgrade(f, chunks[1], &version, required),
     }
     draw_status(f, chunks[2], app);
     draw_input(f, chunks[3], app);
@@ -2215,6 +2359,9 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
         ),
         Screen::Help => format!("  local-llm  {version}  keys and commands{inst}"),
         Screen::Confirm { alias, .. } => format!("  local-llm  delete {alias}{inst}"),
+        Screen::Upgrade { version: to, .. } => {
+            format!("  local-llm  {version} -> {to}{inst}")
+        }
     };
     let p = Paragraph::new(title).style(
         Style::default()
@@ -2275,6 +2422,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         ("/notify", "bell settings"),
         ("/paste", "on or off"),
         ("/img [path]", "send a picture"),
+        ("/update", "check for a new build"),
         ("/leave", "back to the list"),
         ("/lock", "forget the key here"),
         ("/forget", "delete it here"),
@@ -2321,6 +2469,43 @@ fn draw_help_column(f: &mut Frame, area: Rect, title: &str, rows: &[(&str, &str)
             Span::styled((*what).to_string(), dim()),
         ]));
     }
+    f.render_widget(Paragraph::new(lines), area);
+}
+
+fn draw_upgrade(f: &mut Frame, area: Rect, version: &str, required: bool) {
+    let running = env!("CARGO_PKG_VERSION");
+    let mut lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("  version {version} is out — you are on {running}"),
+            Style::default()
+                .fg(Color::Rgb(190, 210, 230))
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+    ];
+    if required {
+        lines.push(Line::from(Span::styled(
+            "  this one is not optional: your build can no longer reach the others.",
+            Style::default().fg(Color::Rgb(230, 190, 120)),
+        )));
+        lines.push(Line::from(""));
+    }
+    lines.extend([
+        Line::from(Span::styled(
+            "  it is downloaded here, checked against its signature, and only then",
+            dim(),
+        )),
+        Line::from(Span::styled(
+            "  put in place. the app restarts and comes back to this room.",
+            dim(),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  enter updates now      any other key leaves it for later",
+            Style::default().fg(Color::Rgb(200, 220, 190)),
+        )),
+    ]);
     f.render_widget(Paragraph::new(lines), area);
 }
 

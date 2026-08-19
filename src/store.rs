@@ -423,6 +423,12 @@ impl DataDir {
         self.root.join("index.toml")
     }
 
+    /// Note left by an update, saying which room to reopen after the restart.
+    /// Holds the topic only -- never the key.
+    pub fn resume_path(&self) -> PathBuf {
+        self.root.join("resume.txt")
+    }
+
     pub fn room_dir(&self, topic: &[u8; 32]) -> PathBuf {
         self.root.join("rooms").join(topic_hex(topic))
     }
