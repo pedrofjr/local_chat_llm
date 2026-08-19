@@ -21,9 +21,20 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, Mutex};
 
-/// Bumped for the v2 record set. An older build simply fails to connect,
-/// which is a better failure than half-understood traffic.
-pub const SYNC_ALPN: &[u8] = b"local-llm/2";
+/// Bumped whenever the sync vocabulary changes -- v3 added the two messages
+/// that move picture blobs. An older build simply fails to connect, which is a
+/// better failure than half-understood traffic.
+pub const SYNC_ALPN: &[u8] = b"local-llm/3";
+
+/// Ceiling on one picture in flight. Its own number on purpose: the record
+/// batch has a 2 MB cap whose errors are swallowed, and sharing that budget is
+/// how a big picture would end up silently blocking text.
+const BLOB_CAP: usize = 4 * 1024 * 1024;
+/// Pictures pulled per sync round. Enough to catch up quickly after being
+/// away, few enough that a backlog cannot monopolise the link.
+const BLOBS_PER_ROUND: usize = 2;
+/// How much disk one room may spend on pictures before the oldest are dropped.
+const ROOM_BLOB_QUOTA: u64 = 200 * 1024 * 1024;
 
 /// Peer addresses from previous sessions, sealed with the room key inside the
 /// room folder. Without this, coming back to a room means asking a colleague
@@ -76,6 +87,17 @@ enum SyncMsg {
     Give {
         records: Vec<Vec<u8>>,
     },
+    /// Asks for the pixels behind one picture. New variants go at the end:
+    /// postcard numbers them by position.
+    Want {
+        blob: [u8; 32],
+    },
+    /// The pixels, still sealed with the room key -- we hand over exactly what
+    /// is on disk, so a peer serving a picture never has to decrypt it. Empty
+    /// when we do not have them either.
+    Blob {
+        sealed: Vec<u8>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -91,6 +113,9 @@ pub enum NetEvent {
     /// room still looks empty, which the UI knows and the network does not.
     Searching(usize),
     Record,
+    /// Pixels for a picture landed. The transcript already has its line; this
+    /// only says it can now be opened.
+    Blob,
     Ticket(String),
 }
 
@@ -114,18 +139,35 @@ impl ProtocolHandler for SyncState {
         let (mut send, mut recv) = connection.accept_bi().await?;
         let req = recv.read_to_end(64 * 1024).await.map_err(io_err)?;
         let msg: SyncMsg = postcard::from_bytes(&req).map_err(io_err)?;
-        if let SyncMsg::Have { heads } = msg {
-            let missing: Vec<Vec<u8>> = {
-                let room = self.room.lock().await;
-                room.log
-                    .missing_for(&heads)
-                    .iter()
-                    .filter_map(|rec| rec.encode().ok())
-                    .collect()
-            };
-            let reply = postcard::to_stdvec(&SyncMsg::Give { records: missing }).map_err(io_err)?;
-            send.write_all(&reply).await.map_err(io_err)?;
-            send.finish()?;
+        match msg {
+            SyncMsg::Have { heads } => {
+                let missing: Vec<Vec<u8>> = {
+                    let room = self.room.lock().await;
+                    room.log
+                        .missing_for(&heads)
+                        .iter()
+                        .filter_map(|rec| rec.encode().ok())
+                        .collect()
+                };
+                let reply =
+                    postcard::to_stdvec(&SyncMsg::Give { records: missing }).map_err(io_err)?;
+                send.write_all(&reply).await.map_err(io_err)?;
+                send.finish()?;
+            }
+            // One picture per connection, on its own stream. Deliberately not
+            // folded into the record batch: that one is read with a 2 MB cap
+            // and its errors are swallowed, so a single large picture in there
+            // would quietly stop *text* from being delivered.
+            SyncMsg::Want { blob } => {
+                let sealed = {
+                    let room = self.room.lock().await;
+                    room.log.read_blob_sealed(&blob).unwrap_or_default()
+                };
+                let reply = postcard::to_stdvec(&SyncMsg::Blob { sealed }).map_err(io_err)?;
+                send.write_all(&reply).await.map_err(io_err)?;
+                send.finish()?;
+            }
+            SyncMsg::Give { .. } | SyncMsg::Blob { .. } => {}
         }
         connection.closed().await;
         Ok(())
@@ -425,6 +467,68 @@ async fn sync_loop(
                 conn.close(0u32.into(), b"ok");
             }
         }
+        fetch_blobs(&endpoint, &room, &events, &known).await;
+    }
+}
+
+/// Fetches the pixels for pictures the log knows about but this machine does
+/// not hold, a few per round on its own connection.
+///
+/// Fetched eagerly rather than when somebody opens the picture: four people on
+/// a LAN, and pulling early means the picture still opens after whoever sent
+/// it has gone home -- which, in a room where everyone closes their laptop at
+/// six, is the difference between a working history and a wall of dead links.
+async fn fetch_blobs(
+    endpoint: &Endpoint,
+    room: &Arc<Mutex<OpenRoom>>,
+    events: &mpsc::UnboundedSender<NetEvent>,
+    known: &Arc<Mutex<Vec<EndpointAddr>>>,
+) {
+    let wanted: Vec<[u8; 32]> = {
+        let room = room.lock().await;
+        room.log
+            .missing_blobs()
+            .into_iter()
+            .take(BLOBS_PER_ROUND)
+            .collect()
+    };
+    if wanted.is_empty() {
+        return;
+    }
+    let me = endpoint.id();
+    for blob in wanted {
+        let Ok(req) = postcard::to_stdvec(&SyncMsg::Want { blob }) else {
+            continue;
+        };
+        // Whoever answers first wins; a picture is worth asking several
+        // people for, since the one who sent it may already be offline.
+        let peers = { known.lock().await.clone() };
+        for addr in peers.into_iter().filter(|a: &EndpointAddr| a.id != me) {
+            let Ok(conn) = endpoint.connect(addr, SYNC_ALPN).await else {
+                continue;
+            };
+            let mut landed = false;
+            if let Ok((mut send, mut recv)) = conn.open_bi().await {
+                if send.write_all(&req).await.is_ok() && send.finish().is_ok() {
+                    if let Ok(buf) = recv.read_to_end(BLOB_CAP).await {
+                        if let Ok(SyncMsg::Blob { sealed }) = postcard::from_bytes(&buf) {
+                            if !sealed.is_empty() {
+                                let room = room.lock().await;
+                                if room.log.accept_blob(&blob, &sealed) {
+                                    let _ = room.log.prune_blobs(ROOM_BLOB_QUOTA);
+                                    let _ = events.send(NetEvent::Blob);
+                                    landed = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            conn.close(0u32.into(), b"ok");
+            if landed {
+                break;
+            }
+        }
     }
 }
 
@@ -647,6 +751,93 @@ mod tests {
             id: SecretKey::generate().public(),
             addrs: Default::default(),
         }
+    }
+
+    /// A real endpoint on the loopback, no mDNS and no relay. Everything here
+    /// stays inside this process.
+    async fn local_endpoint() -> Endpoint {
+        let endpoint = Endpoint::builder(presets::Minimal)
+            .relay_mode(RelayMode::Disabled)
+            .secret_key(SecretKey::generate())
+            .bind()
+            .await
+            .expect("bind");
+        wait_for_addrs(&endpoint).await;
+        endpoint
+    }
+
+    /// Two real iroh endpoints, one asking the other for the pixels behind a
+    /// picture. The rest of the suite checks address bookkeeping with structs;
+    /// this one puts bytes through an actual QUIC stream, because the blob
+    /// path is new protocol and its failure mode -- a picture that never
+    /// arrives -- looks exactly like a slow network from the outside.
+    #[tokio::test]
+    async fn a_peer_serves_the_pixels_it_holds() {
+        let pin = Pin::parse("7K2M-9QXP").unwrap();
+        let (ta, tb) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let open = |tmp: &TempDir| {
+            let dir = DataDir::from_path(tmp.path().to_path_buf()).unwrap();
+            OpenRoom::join(&dir, pin.clone(), Some("sala")).unwrap()
+        };
+        let (mut giver, taker) = (open(&ta), open(&tb));
+
+        let pixels = vec![0xa5u8; 40_000];
+        let rec = giver
+            .compose_image(
+                &pixels,
+                320,
+                240,
+                crate::store::ImageKind::Png,
+                String::new(),
+                None,
+            )
+            .unwrap();
+        let Record::Image { blob, .. } = &rec else {
+            panic!("expected a picture");
+        };
+        let blob = *blob;
+
+        // The taker learns the picture exists but has none of its bytes --
+        // exactly the state gossip leaves a peer in.
+        let taker = Arc::new(Mutex::new(taker));
+        taker.lock().await.ingest(rec).unwrap();
+        assert_eq!(taker.lock().await.log.missing_blobs(), vec![blob]);
+
+        let giver = Arc::new(Mutex::new(giver));
+        let serving = local_endpoint().await;
+        let router = Router::builder(serving.clone())
+            .accept(SYNC_ALPN, SyncState { room: giver })
+            .spawn();
+        let mut serving_addr = serving.addr();
+        serving_addr.addrs.insert(TransportAddr::Ip(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            serving.bound_sockets()[0].port(),
+        )));
+
+        let asking = local_endpoint().await;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let known = Arc::new(Mutex::new(vec![serving_addr]));
+        fetch_blobs(&asking, &taker, &tx, &known).await;
+
+        assert!(
+            taker.lock().await.log.has_blob(&blob),
+            "the pixels should have crossed the wire"
+        );
+        assert_eq!(
+            taker.lock().await.log.read_blob(&blob).as_deref(),
+            Some(pixels.as_slice()),
+            "and arrived intact"
+        );
+        assert!(
+            taker.lock().await.log.missing_blobs().is_empty(),
+            "nothing left to ask for"
+        );
+        assert!(
+            matches!(rx.try_recv(), Ok(NetEvent::Blob)),
+            "the screen has to be told it can open now"
+        );
+
+        router.shutdown().await.ok();
     }
 
     fn addr_with(ips: &[&str]) -> EndpointAddr {

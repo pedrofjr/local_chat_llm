@@ -1,5 +1,5 @@
 use crate::crypto::{role_for, whisper_key, whisper_public, whisper_secret, Pin, RoomKey};
-use crate::store::{now_ts, DataDir, Record, RoomLog};
+use crate::store::{now_ts, DataDir, ImageKind, Record, RoomLog};
 use anyhow::{anyhow, Result};
 use iroh::{PublicKey, SecretKey};
 use serde::{Deserialize, Serialize};
@@ -74,6 +74,57 @@ impl OpenRoom {
         Ok(rec)
     }
 
+    /// Files the pixels away as a blob and puts only their description in the
+    /// log. The caller has already sized and re-encoded them; this decides
+    /// nothing about the picture, it just names and signs it.
+    pub fn compose_image(
+        &mut self,
+        pixels: &[u8],
+        w: u32,
+        h: u32,
+        kind: ImageKind,
+        caption: String,
+        reply_to: Option<([u8; 32], u64)>,
+    ) -> Result<Record> {
+        let blob = *blake3::hash(pixels).as_bytes();
+        // Written before the record exists, so the log can never point at a
+        // blob this machine does not have.
+        self.log.write_blob(&blob, pixels)?;
+        let seq = self.log.next_seq_for(&self.author);
+        let ts = now_ts();
+        let name = self.nick.clone();
+        let bytes = u32::try_from(pixels.len()).map_err(|_| anyhow!("picture too large"))?;
+        let sig = self.secret.sign(&image_payload(
+            &self.author,
+            seq,
+            ts,
+            &name,
+            &blob,
+            w,
+            h,
+            kind,
+            bytes,
+            &caption,
+            reply_to,
+        ));
+        let rec = Record::Image {
+            author: self.author,
+            seq,
+            ts,
+            name,
+            blob,
+            w,
+            h,
+            kind,
+            bytes,
+            caption,
+            reply_to,
+            sig: sig.to_bytes().to_vec(),
+        };
+        self.log.append(rec.clone())?;
+        Ok(rec)
+    }
+
     pub fn ingest(&mut self, rec: Record) -> Result<bool> {
         match &rec {
             Record::Chat {
@@ -131,6 +182,26 @@ impl OpenRoom {
                 verify_sig(author, sig, &presence_payload(author, name, addr, *ts))?;
                 return Ok(false);
             }
+            Record::Image {
+                author,
+                seq,
+                ts,
+                name,
+                blob,
+                w,
+                h,
+                kind,
+                bytes,
+                caption,
+                reply_to,
+                sig,
+            } => verify_sig(
+                author,
+                sig,
+                &image_payload(
+                    author, *seq, *ts, name, blob, *w, *h, *kind, *bytes, caption, *reply_to,
+                ),
+            )?,
             Record::Meta { .. } => {}
         }
         self.log.append(rec)
@@ -236,7 +307,9 @@ impl OpenRoom {
 
     pub fn label_of(&self, rec: &Record) -> String {
         match rec {
-            Record::ChatNamed { name, .. } | Record::Post { name, .. } => name.clone(),
+            Record::ChatNamed { name, .. }
+            | Record::Post { name, .. }
+            | Record::Image { name, .. } => name.clone(),
             Record::Chat { author, .. } | Record::Whisper { author, .. } => {
                 if *author == self.author {
                     self.nick.clone()
@@ -326,6 +399,47 @@ pub fn whisper_payload(author: &[u8; 32], seq: u64, ts: u64, to: &[u8; 32], ct: 
     )
 }
 
+/// Covers the blob *hash* rather than the pixels, which are not here. Since
+/// `read_blob` refuses any blob whose content stops matching its name, signing
+/// the hash authenticates the picture itself: swapping the bytes on disk or in
+/// flight makes them stop opening.
+#[allow(clippy::too_many_arguments)]
+pub fn image_payload(
+    author: &[u8; 32],
+    seq: u64,
+    ts: u64,
+    name: &str,
+    blob: &[u8; 32],
+    w: u32,
+    h: u32,
+    kind: ImageKind,
+    bytes: u32,
+    caption: &str,
+    reply_to: Option<([u8; 32], u64)>,
+) -> Vec<u8> {
+    let mut answered = Vec::new();
+    if let Some((target, target_seq)) = reply_to {
+        answered.extend_from_slice(&target);
+        answered.extend_from_slice(&target_seq.to_le_bytes());
+    }
+    signed_bytes(
+        "local-llm/image/v1",
+        &[
+            author,
+            &seq.to_le_bytes(),
+            &ts.to_le_bytes(),
+            name.as_bytes(),
+            blob,
+            &w.to_le_bytes(),
+            &h.to_le_bytes(),
+            &[kind as u8],
+            &bytes.to_le_bytes(),
+            caption.as_bytes(),
+            &answered,
+        ],
+    )
+}
+
 /// Legacy framing, kept only to verify records written before v2.
 fn sign_payload(body: &str, seq: u64, ts: u64, name: Option<&str>) -> Vec<u8> {
     let mut unsigned = body.as_bytes().to_vec();
@@ -369,6 +483,48 @@ mod tests {
     fn open_at(tmp: &TempDir, pin: &Pin) -> OpenRoom {
         let dir = DataDir::from_path(tmp.path().to_path_buf()).unwrap();
         OpenRoom::join(&dir, pin.clone(), Some("sala")).unwrap()
+    }
+
+    #[test]
+    fn a_picture_cannot_be_swapped_for_another() {
+        let pin = Pin::parse("7K2M-9QXP").unwrap();
+        let (ta, tb) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let (mut a, mut b) = (open_at(&ta, &pin), open_at(&tb, &pin));
+
+        let pixels = b"conteudo original da imagem".to_vec();
+        let rec = a
+            .compose_image(&pixels, 320, 240, ImageKind::Png, "o erro".into(), None)
+            .unwrap();
+
+        // The sender files the pixels away before announcing them, so the log
+        // never points at a blob this machine does not hold.
+        let Record::Image { blob, .. } = &rec else {
+            panic!("expected a picture");
+        };
+        assert_eq!(a.log.read_blob(blob).as_deref(), Some(pixels.as_slice()));
+
+        assert!(b.ingest(rec.clone()).unwrap(), "a good picture is accepted");
+
+        // Repointing the record at different pixels breaks the signature,
+        // because the hash is what was signed.
+        let mut forged = rec.clone();
+        if let Record::Image { blob, .. } = &mut forged {
+            *blob = [0xcd; 32];
+        }
+        assert!(
+            b.ingest(forged).is_err(),
+            "a picture repointed at other bytes must not verify"
+        );
+
+        // Same for the caption, which is what people actually read.
+        let mut relabelled = rec;
+        if let Record::Image { caption, .. } = &mut relabelled {
+            *caption = "outra legenda".into();
+        }
+        assert!(
+            b.ingest(relabelled).is_err(),
+            "the caption is covered by the signature"
+        );
     }
 
     #[test]

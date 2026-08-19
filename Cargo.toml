@@ -25,6 +25,13 @@ iroh-mdns-address-lookup = "0.4"
 postcard = { version = "1", default-features = false, features = ["alloc", "use-std"] }
 rand = "0.8"
 ratatui = "0.30"
+# Draws pictures through whatever the terminal speaks: sixel on Windows
+# Terminal 1.22+, unicode halfblocks everywhere else. No native C library
+# involved -- the sixel encoder is icy_sixel, in Rust.
+ratatui-image = { version = "11", default-features = false, features = ["crossterm"] }
+# Only the three formats we accept. Every extra decoder is more binary and
+# more parser exposed to whatever a peer sends.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif"] }
 serde = { version = "1", features = ["derive"] }
 time = { version = "0.3", default-features = false, features = ["std", "local-offset"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }

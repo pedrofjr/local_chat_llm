@@ -1,7 +1,9 @@
 use crate::crypto::{color_for, role_for, topic_id, Pin};
 use crate::net::{parse_ticket, NetEvent, NetSession, Presence};
 use crate::room::OpenRoom;
-use crate::store::{now_ts, DataDir, Notify, Record, Settings};
+use crate::store::{now_ts, DataDir, ImageKind, ImageProto, Notify, Record, Settings};
+use ratatui_image::picker::{Picker, ProtocolType};
+use ratatui_image::sliced::{SignedPosition, SlicedImage, SlicedProtocol};
 use anyhow::Result;
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
@@ -16,7 +18,7 @@ use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Paragraph, Widget};
 use ratatui::{Frame, Terminal};
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Stdout, Write};
@@ -76,7 +78,25 @@ enum Feed {
         reply_to: Option<([u8; 32], u64)>,
         /// Set when this is a whisper; holds the other side of it.
         whisper: Option<[u8; 32]>,
+        /// Set when this message is a picture. Deliberately a field on `Msg`
+        /// rather than a variant of its own: reply, copy, hide, hover, the
+        /// per-person colour and the left/right alignment all keep working
+        /// without a second copy of that code. Boxed because a picture is
+        /// the rare case, and inline it made every plain notice in the feed
+        /// carry its weight.
+        image: Option<Box<ImageRef>>,
     },
+}
+
+/// Enough to draw the collapsed `image (+)` line without holding any pixels.
+/// The bytes live in a blob that may not even have arrived yet.
+#[derive(Clone)]
+struct ImageRef {
+    blob: [u8; 32],
+    w: u32,
+    h: u32,
+    kind: ImageKind,
+    bytes: u32,
 }
 
 /// Someone heard from recently, and when.
@@ -265,6 +285,93 @@ pub struct App {
     /// Set by a click on the hide icon and consumed by the event loop, which
     /// can await the write that the mouse handler cannot.
     pending_hide: Option<usize>,
+    /// Pictures opened on this screen. Deliberately **not** persisted: every
+    /// session starts with everything closed, so a screenshot never paints
+    /// itself onto the terminal just because the room was reopened.
+    expanded: HashSet<([u8; 32], u64)>,
+    /// Bumped on every open or close, so the layout cache notices.
+    expanded_rev: u64,
+    /// Pixels decoded and encoded for the terminal, keyed by blob. Built when
+    /// a picture is opened and dropped when it is closed.
+    shots: HashMap<[u8; 32], Shot>,
+    /// How this terminal draws. Settled once at startup, never re-queried.
+    proto: ImageProto,
+    /// Set by a click on the picture line, consumed by the event loop.
+    pending_expand: Option<usize>,
+    /// Blobs actually painted last frame. An animation nobody can see must
+    /// not keep waking the loop, and scrolling a gif off the top is the
+    /// commonest way for that to happen.
+    on_screen: Vec<[u8; 32]>,
+}
+
+/// A picture decoded and encoded for the terminal, ready to be drawn.
+struct Shot {
+    /// One entry per frame; a still picture has exactly one. Sliced so a
+    /// picture half off the top or bottom of the viewport is drawn cut,
+    /// rather than vanishing whole the moment it stops fitting.
+    frames: Vec<SlicedProtocol>,
+    /// How long each frame stays up, in milliseconds.
+    delays: Vec<u32>,
+    /// Which frame is showing.
+    at: usize,
+    /// When the next frame is due. `None` for a still picture, which never
+    /// advances and so never wakes the loop.
+    next: Option<Instant>,
+    /// The cell area these frames were encoded for. Encoding is the expensive
+    /// part, so it is redone only when the terminal is actually resized.
+    for_area: ratatui::layout::Size,
+}
+
+impl Shot {
+    fn rows(&self) -> u16 {
+        self.for_area.height
+    }
+
+    fn animated(&self) -> bool {
+        self.frames.len() > 1
+    }
+}
+
+/// Advances every visible animation whose frame is due.
+///
+/// Nothing here is expensive: the frames were encoded when the picture was
+/// opened, so advancing is picking a different one out of the list.
+fn tick_animations(app: &mut App) {
+    // Under the disguise nothing is drawn, so nothing should be moving
+    // either -- an app that keeps working while it claims to be idle is the
+    // sort of detail that gives it away.
+    if app.masked {
+        return;
+    }
+    let now = Instant::now();
+    let on_screen = std::mem::take(&mut app.on_screen);
+    for (blob, shot) in app.shots.iter_mut() {
+        if !shot.animated() || !on_screen.contains(blob) {
+            continue;
+        }
+        let Some(due) = shot.next else { continue };
+        if due <= now {
+            shot.at = (shot.at + 1) % shot.frames.len();
+            let delay = shot.delays.get(shot.at).copied().unwrap_or(100).max(20);
+            // From `now` rather than from `due`: a frame that came late must
+            // not make the next one land immediately and cascade.
+            shot.next = Some(now + Duration::from_millis(u64::from(delay)));
+        }
+    }
+    app.on_screen = on_screen;
+}
+
+/// When the next frame of anything currently on screen is due. `None` means
+/// nothing is moving and the loop can go back to the presence clock.
+fn next_frame_due(app: &App) -> Option<Instant> {
+    if app.masked {
+        return None;
+    }
+    app.shots
+        .iter()
+        .filter(|(blob, shot)| shot.animated() && app.on_screen.contains(blob))
+        .filter_map(|(_, shot)| shot.next)
+        .min()
 }
 
 impl App {
@@ -272,6 +379,7 @@ impl App {
         let dir = DataDir::open()?;
         let nick = dir.load_nick();
         let settings = dir.load_settings();
+        let proto = settings.image_proto;
         let mut app = Self {
             dir,
             screen: Screen::Home,
@@ -309,6 +417,12 @@ impl App {
             hidden: HashSet::new(),
             hidden_rev: 0,
             pending_hide: None,
+            expanded: HashSet::new(),
+            expanded_rev: 0,
+            shots: HashMap::new(),
+            proto,
+            pending_expand: None,
+            on_screen: Vec::new(),
         };
         app.refresh_sessions();
         Ok(app)
@@ -396,8 +510,12 @@ impl App {
     /// Which icon, if any, sits under a click. Checked before the plain
     /// "select this message" fallback.
     fn action_at(&self, row: u16, column: u16) -> Option<Action> {
-        let anchor = self.rendered.as_ref()?.layout.actions.as_ref()?;
+        let layout = &self.rendered.as_ref()?.layout;
         let line = row.checked_sub(self.chat_area.y)? as usize + self.scroll as usize;
+        if layout.toggles.iter().any(|(at, _)| *at == line) {
+            return Some(Action::Expand);
+        }
+        let anchor = layout.actions.as_ref()?;
         if line != anchor.line {
             return None;
         }
@@ -515,6 +633,12 @@ pub async fn run() -> Result<()> {
         EnableBracketedPaste,
         EnableMouseCapture
     )?;
+    // The one safe moment to ask the terminal what it can draw: raw mode is on
+    // (the query needs it) and the input thread does not exist yet. Asking
+    // later means two readers racing for the same bytes on stdin -- the answer
+    // arrives as keystrokes and the query waits forever. Inside the alternate
+    // screen, so anything the terminal echoes back dies with it.
+    settle_image_proto();
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     let result = run_inner(&mut terminal).await;
@@ -527,6 +651,60 @@ pub async fn run() -> Result<()> {
     )?;
     terminal.show_cursor()?;
     result
+}
+
+/// How long we wait for the terminal to say what it can draw. Windows Terminal
+/// answers in milliseconds; anything that has not replied by now either cannot
+/// or is not a terminal at all.
+const PROTO_QUERY_WAIT: Duration = Duration::from_secs(3);
+
+/// Works out how this terminal draws pictures, once per install, and writes the
+/// answer down.
+///
+/// Deliberately never retried: the query is the one thing in this program that
+/// reads stdin outside the input thread, and a second attempt while the app is
+/// running would steal keystrokes. A wrong guess is fixable with `/img proto`;
+/// a stolen keystroke looks like the app is broken.
+fn settle_image_proto() {
+    let Ok(dir) = DataDir::open() else { return };
+    let mut settings = dir.load_settings();
+    if settings.image_proto != ImageProto::Unknown {
+        return;
+    }
+    // On its own thread with a deadline: the query can block on a terminal
+    // that never answers, and hanging on startup is worse than halfblocks.
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("proto-query".into())
+        .spawn(move || {
+            let found = match Picker::from_query_stdio() {
+                Ok(picker) if picker.protocol_type() == ProtocolType::Sixel => ImageProto::Sixel,
+                // Kitty and iTerm2 do not exist on Windows, and we would not
+                // know what to do with them here anyway.
+                _ => ImageProto::Halfblocks,
+            };
+            let _ = tx.send(found);
+        })
+        .ok();
+    settings.image_proto = rx
+        .recv_timeout(PROTO_QUERY_WAIT)
+        .unwrap_or(ImageProto::Halfblocks);
+    let _ = dir.save_settings(&settings);
+}
+
+/// Builds the picker from what we already decided, without touching stdin.
+fn picker_for(proto: ImageProto) -> Picker {
+    match proto {
+        ImageProto::Sixel => {
+            // `halfblocks()` is just "a picker with a sane assumed cell size"
+            // -- 10x20, the same numbers CELL_W/CELL_H lay out against -- and
+            // unlike the querying constructors it never touches stdin.
+            let mut picker = Picker::halfblocks();
+            picker.set_protocol_type(ProtocolType::Sixel);
+            picker
+        }
+        _ => Picker::halfblocks(),
+    }
 }
 
 /// Reads the terminal, tagging each event with whether it arrived as part of a
@@ -606,7 +784,16 @@ async fn run_inner(terminal: &mut Term) -> Result<()> {
     let mut app = App::new()?;
     let mut events = spawn_input_thread();
     loop {
+        // Frames advance before the draw, so what is painted is what is due.
+        tick_animations(&mut app);
         terminal.draw(|f| draw(f, &mut app))?;
+        // Asked *after* drawing: the draw is what establishes which pictures
+        // are actually on screen, and asking before it would miss the frame
+        // that was just opened and sleep on the presence clock instead.
+        let next_wake = next_frame_due(&app)
+            .map(|at| at.saturating_duration_since(Instant::now()))
+            .unwrap_or(PRESENCE_TTL / 4)
+            .min(PRESENCE_TTL / 4);
         tokio::select! {
             maybe = events.recv() => {
                 let Some((ev, pasting)) = maybe else { continue };
@@ -626,6 +813,9 @@ async fn run_inner(terminal: &mut Term) -> Result<()> {
                         if let Some(idx) = app.pending_hide.take() {
                             toggle_hidden(&mut app, idx).await;
                         }
+                        if let Some(idx) = app.pending_expand.take() {
+                            toggle_expanded(&mut app, idx).await;
+                        }
                     }
                     _ => {}
                 }
@@ -636,8 +826,12 @@ async fn run_inner(terminal: &mut Term) -> Result<()> {
                 }
             }
             // Nothing arrives when a room falls silent, so the clock has to
-            // come from somewhere for people to age out of the roster.
-            _ = tokio::time::sleep(PRESENCE_TTL / 4) => sweep_presence(&mut app),
+            // come from somewhere for people to age out of the roster. With a
+            // gif open it also has to fire on the next frame, so the wait is
+            // whichever comes first. With nothing moving -- the normal case,
+            // since pictures start closed -- it is the presence clock and the
+            // app goes right back to idle.
+            _ = tokio::time::sleep(next_wake) => sweep_presence(&mut app),
         }
     }
     app.shutdown_net().await;
@@ -706,6 +900,10 @@ async fn apply_net(app: &mut App, ev: NetEvent) {
                 app.notice(format!("{name} is here"));
             }
         }
+        // Pixels arrived for a line already on screen. Nothing to say and
+        // nothing to read from the log -- only the layout cache has to let go,
+        // so a picture waiting on its bytes can now be opened.
+        NetEvent::Blob => app.rendered = None,
         NetEvent::Record => {
             let before = app.consumed;
             let seen = app.feed.len();
@@ -772,6 +970,7 @@ async fn sync_feed(app: &mut App) {
                     ts: *ts,
                     reply_to: None,
                     whisper: Some(them),
+                    image: None,
                 });
             }
             Record::Chat { author, seq, ts, .. }
@@ -795,6 +994,43 @@ async fn sync_feed(app: &mut App) {
                     ts: *ts,
                     reply_to: rec.reply_to(),
                     whisper: None,
+                    image: None,
+                });
+            }
+            Record::Image {
+                author,
+                seq,
+                ts,
+                blob,
+                w,
+                h,
+                kind,
+                bytes,
+                caption,
+                reply_to,
+                ..
+            } => {
+                let name = room.label_of(rec);
+                app.names.insert(*author, name.clone());
+                app.by_key.insert((*author, *seq), app.feed.len());
+                app.feed.push(Feed::Msg {
+                    author: *author,
+                    seq: *seq,
+                    name,
+                    mine: room.is_mine(rec),
+                    // The caption doubles as the body, so a picture sent with
+                    // a sentence still mentions people and rings the bell.
+                    body: caption.clone(),
+                    ts: *ts,
+                    reply_to: *reply_to,
+                    whisper: None,
+                    image: Some(Box::new(ImageRef {
+                        blob: *blob,
+                        w: *w,
+                        h: *h,
+                        kind: *kind,
+                        bytes: *bytes,
+                    })),
                 });
             }
         }
@@ -870,6 +1106,10 @@ enum Action {
     Reply,
     Copy,
     Hide,
+    /// The `image (+)` / `image (-)` line itself is the button; clicking the
+    /// picture's own line is more obvious than hunting for a fourth icon in
+    /// the hover ruler.
+    Expand,
 }
 
 const HIDDEN_FILE: &str = "hidden.bin";
@@ -912,6 +1152,105 @@ async fn toggle_hidden(app: &mut App, idx: usize) {
         "message shown again".into()
     };
     save_hidden(app).await;
+}
+
+/// Opens or closes the picture on message `idx`.
+///
+/// Closing throws the decoded frames away rather than keeping them warm: a
+/// closed picture must not be sitting in memory ready to paint, and a room
+/// scrolled through end to end would otherwise hold every screenshot ever sent.
+async fn toggle_expanded(app: &mut App, idx: usize) {
+    let Some(Feed::Msg {
+        author,
+        seq,
+        image: Some(img),
+        ..
+    }) = app.feed.get(idx)
+    else {
+        app.status = "that message has no picture".into();
+        return;
+    };
+    let (key, img) = ((*author, *seq), (**img).clone());
+
+    if app.expanded.remove(&key) {
+        app.shots.remove(&img.blob);
+        app.expanded_rev += 1;
+        app.status = "picture closed".into();
+        return;
+    }
+    if app.masked {
+        app.status = "not while the disguise is on".into();
+        return;
+    }
+    app.expanded.insert(key);
+    app.expanded_rev += 1;
+    match build_shot(app, &img).await {
+        Ok(shot) => {
+            let frames = shot.frames.len();
+            app.shots.insert(img.blob, shot);
+            app.status = if frames > 1 {
+                format!("picture open — {frames} frames")
+            } else {
+                "picture open".into()
+            };
+        }
+        Err(why) => {
+            // Stays "expanded" so the line reads as waiting rather than
+            // silently snapping shut under the pointer.
+            app.status = why;
+        }
+    }
+}
+
+/// Decodes a blob and encodes it for this terminal, at the size it will be
+/// drawn. The encoding is the expensive half, so it happens here -- once, on a
+/// deliberate keypress -- and not while drawing frames.
+async fn build_shot(app: &App, img: &ImageRef) -> Result<Shot, String> {
+    let Some(room) = &app.room else {
+        return Err("no room open".into());
+    };
+    let bytes = { room.lock().await.log.read_blob(&img.blob) };
+    let Some(bytes) = bytes else {
+        return Err("waiting for the pixels to arrive…".into());
+    };
+
+    let width = app.chat_area.width;
+    let max_cols = if width <= 34 {
+        width.saturating_sub(4)
+    } else {
+        (width * 7) / 10
+    };
+    let (cols, rows) = fit_cells(img.w, img.h, max_cols, IMAGE_MAX_ROWS);
+    if cols == 0 || rows == 0 {
+        return Err("terminal too small for that picture".into());
+    }
+
+    let frames = crate::media::frames(&bytes, img.kind, MAX_GIF_FRAMES)
+        .map_err(|e| format!("cannot read that picture: {e}"))?;
+    let picker = picker_for(app.proto);
+    let area = ratatui::layout::Size::new(cols, rows);
+    let mut encoded = Vec::with_capacity(frames.len());
+    let mut delays = Vec::with_capacity(frames.len());
+    for frame in frames {
+        let proto = SlicedProtocol::new_with_resize(
+            &picker,
+            frame.image,
+            area,
+            ratatui_image::Resize::Fit(None),
+        )
+        .map_err(|e| format!("cannot draw that picture: {e}"))?;
+        encoded.push(proto);
+        delays.push(frame.delay_ms);
+    }
+    let next = (encoded.len() > 1)
+        .then(|| Instant::now() + Duration::from_millis(u64::from(delays[0].max(20))));
+    Ok(Shot {
+        frames: encoded,
+        delays,
+        at: 0,
+        next,
+        for_area: area,
+    })
 }
 
 /// Points the next message at `idx`.
@@ -1018,6 +1357,9 @@ fn handle_mouse(app: &mut App, ev: crossterm::event::MouseEvent) {
                 // Hiding writes to disk, which the mouse handler cannot await;
                 // the click marks the message and the key does the rest.
                 Some(Action::Hide) => app.pending_hide = Some(idx),
+                // Same reason as Hide: opening reads a blob and decodes it,
+                // which the mouse handler has no way to await.
+                Some(Action::Expand) => app.pending_expand = Some(idx),
                 None => app.picked = Some(idx),
             }
         }
@@ -1196,6 +1538,10 @@ async fn handle_chat<B: Backend>(
         KeyCode::Char('y') if is_shortcut(&key) => match app.picked.or(app.hover) {
             Some(idx) => copy_message(app, idx),
             None => app.status = "alt+up picks a message to copy".into(),
+        },
+        KeyCode::Char('g') if is_shortcut(&key) => match app.picked.or(app.hover) {
+            Some(idx) => toggle_expanded(app, idx).await,
+            None => app.status = "alt+up picks a picture to open".into(),
         },
         KeyCode::PageUp => {
             app.follow = false;
@@ -1404,12 +1750,119 @@ async fn handle_command<B: Backend>(
         "/forget" | "/delete" => return forget(app, &rest).await,
         "/w" | "/whisper" => whisper_cmd(app, &line).await,
         "/paste" => paste_cmd(app, &rest)?,
+        "/img" | "/image" => image_cmd(app, &line).await,
         "/notify" | "/mute" => notify_cmd(app, &rest)?,
         "/diag" => diag(app).await,
         "/help" | "/?" => app.screen = Screen::Help,
         other => app.status = format!("no such command: {other} — /help"),
     }
     Ok(false)
+}
+
+/// `/img <path>` sends a picture, `/img proto ...` overrides how they are
+/// drawn. The path is taken from the raw line rather than the whitespace-split
+/// `rest`, so `C:\Users\Pedro Ailton\erro.png` survives.
+async fn image_cmd(app: &mut App, line: &str) {
+    let arg = line
+        .split_once(char::is_whitespace)
+        .map(|(_, rest)| rest.trim())
+        .unwrap_or("");
+
+    if let Some(which) = arg.strip_prefix("proto").map(str::trim) {
+        let chosen = match which {
+            "sixel" => ImageProto::Sixel,
+            "halfblocks" | "blocks" => ImageProto::Halfblocks,
+            // Clears the stored answer; the next start asks the terminal again.
+            "auto" | "" => ImageProto::Unknown,
+            other => {
+                app.status = format!("unknown protocol {other} — sixel, halfblocks or auto");
+                return;
+            }
+        };
+        let mut settings = app.dir.load_settings();
+        settings.image_proto = chosen;
+        let _ = app.dir.save_settings(&settings);
+        app.settings.image_proto = chosen;
+        app.proto = chosen;
+        // Anything already encoded was drawn the old way.
+        app.shots.clear();
+        app.expanded.clear();
+        app.expanded_rev += 1;
+        app.status = match chosen {
+            ImageProto::Sixel => "drawing pictures as sixels".into(),
+            ImageProto::Halfblocks => "drawing pictures as half-blocks".into(),
+            ImageProto::Unknown => "will ask the terminal again on next start".into(),
+        };
+        return;
+    }
+
+    if app.room.is_none() {
+        app.status = "open a room first".into();
+        return;
+    }
+    if arg.is_empty() {
+        app.status = "usage: /img C:\\path\\to\\picture.png".into();
+        return;
+    }
+    // Quotes are what the Explorer's "copy as path" puts around a path.
+    let path = arg.trim_matches('"');
+    let raw = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            app.status = format!("cannot read {path}: {e}");
+            return;
+        }
+    };
+    send_image(app, raw).await;
+}
+
+/// Shrinks a picture to something worth putting on a LAN, files it, and
+/// announces it.
+async fn send_image(app: &mut App, raw: Vec<u8>) {
+    let ready = match crate::media::prepare(&raw) {
+        Ok(ready) => ready,
+        Err(e) => {
+            app.status = e.to_string();
+            return;
+        }
+    };
+    let Some(room) = app.room.clone() else { return };
+    let reply = app.replying;
+    let rec = {
+        let mut room = room.lock().await;
+        match room.compose_image(
+            &ready.bytes,
+            ready.w,
+            ready.h,
+            ready.kind,
+            String::new(),
+            reply,
+        ) {
+            Ok(rec) => rec,
+            Err(e) => {
+                app.status = format!("could not save picture: {e}");
+                return;
+            }
+        }
+    };
+    app.replying = None;
+    app.picked = None;
+    app.follow = true;
+    app.unread = 0;
+    sync_feed(app).await;
+    let size = format!("{}x{}", ready.w, ready.h);
+    match &app.net {
+        Some(net) => {
+            // Only the description goes out over gossip; the pixels wait for
+            // whoever wants them to ask on their own stream.
+            if let Err(e) = net.broadcast(&rec).await {
+                app.status = format!("not delivered: {e}");
+            } else {
+                app.status = format!("sent {size}, {}", human_bytes(ready.bytes.len() as u32));
+            }
+        }
+        None => app.status = format!("offline — {size} saved here, not sent"),
+    }
 }
 
 /// Wiping history is irreversible and there is no second copy. Naming the
@@ -1792,6 +2245,7 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
         picked: app.picked,
         replying: app.replying,
         hidden_rev: app.hidden_rev,
+        expanded_rev: app.expanded_rev,
     };
     if app.rendered.as_ref().map(|r| r.key) != Some(key) {
         let layout = build_lines(app, area.width);
@@ -1837,6 +2291,8 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
     let Some(rendered) = app.rendered.as_ref() else {
         return;
     };
+    let slots = rendered.layout.images.clone();
+    let mut painted: Vec<[u8; 32]> = Vec::new();
     let buf = f.buffer_mut();
     for (row, line) in rendered
         .layout
@@ -1848,6 +2304,31 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
     {
         buf.set_line(area.x, area.y + row as u16, line, area.width);
     }
+
+    // Pixels go on last, over the blank lines `build_lines` reserved for them.
+    // A picture cannot live in the cell grid the way a glyph does, so it is
+    // painted rather than laid out -- but the room it needs was already
+    // accounted for, which is what keeps scrolling honest.
+    for slot in slots {
+        let Some(shot) = app.shots.get(&slot.blob) else {
+            continue;
+        };
+        let Some(proto) = shot.frames.get(shot.at) else {
+            continue;
+        };
+        let top = slot.first_line as isize - scroll as isize;
+        // Entirely above or below what is on screen.
+        if top >= viewport as isize || top + slot.rows as isize <= 0 {
+            continue;
+        }
+        let position = SignedPosition {
+            x: i16::try_from(slot.col).unwrap_or(0),
+            y: i16::try_from(top).unwrap_or(i16::MIN),
+        };
+        SlicedImage::new(proto, position).render(area, buf);
+        painted.push(slot.blob);
+    }
+    app.on_screen = painted;
 }
 
 /// True when `nick` appears in `text` as a whole word, with or without a
@@ -2021,6 +2502,26 @@ struct Transcript {
     lines: Vec<Line<'static>>,
     owners: Vec<Option<usize>>,
     actions: Option<ActionAnchor>,
+    /// Where an opened picture reserved room for itself. The lines are left
+    /// blank and the pixels are painted over them after the text, because a
+    /// picture does not live in the cell grid the way a glyph does.
+    images: Vec<ImageSlot>,
+    /// Lines that open or close a picture when clicked, and which message
+    /// each belongs to.
+    toggles: Vec<(usize, usize)>,
+}
+
+#[derive(Clone, Copy)]
+struct ImageSlot {
+    /// First reserved line, as an index into `lines`.
+    first_line: usize,
+    /// Which blob to paint there.
+    blob: [u8; 32],
+    /// How many lines were reserved.
+    rows: u16,
+    /// Left edge, relative to the transcript area. Mirrors the bubble, so a
+    /// picture you sent sits on the right like your text does.
+    col: u16,
 }
 
 /// Everything that changes the layout. While this holds still the previous
@@ -2034,6 +2535,7 @@ struct RenderKey {
     picked: Option<usize>,
     replying: Option<([u8; 32], u64)>,
     hidden_rev: u64,
+    expanded_rev: u64,
 }
 
 /// Collects lines together with their owning feed item, so the two can never
@@ -2042,6 +2544,8 @@ struct Sink {
     lines: Vec<Line<'static>>,
     owners: Vec<Option<usize>>,
     actions: Option<ActionAnchor>,
+    images: Vec<ImageSlot>,
+    toggles: Vec<(usize, usize)>,
 }
 
 impl Sink {
@@ -2056,6 +2560,90 @@ impl Sink {
 
     fn arm(&mut self, anchor: ActionAnchor) {
         self.actions = Some(anchor);
+    }
+}
+
+/// Ceiling on how many frames of one gif we decode. A long animation is a
+/// list of full-size images: cheap on disk, very much not in memory.
+const MAX_GIF_FRAMES: usize = 120;
+
+/// Tallest a picture may get. A screenshot that fills the window buries the
+/// conversation it belongs to, and scrolling past it becomes the main activity.
+const IMAGE_MAX_ROWS: u16 = 20;
+/// Assumed cell shape. Terminals are roughly twice as tall as they are wide
+/// per cell; being a little off makes a picture slightly squat, not broken.
+const CELL_W: u32 = 10;
+const CELL_H: u32 = 20;
+
+/// How many cells a `w`x`h` picture wants, kept inside the given bounds and
+/// keeping its shape.
+fn fit_cells(w: u32, h: u32, max_cols: u16, max_rows: u16) -> (u16, u16) {
+    if w == 0 || h == 0 || max_cols == 0 || max_rows == 0 {
+        return (0, 0);
+    }
+    // Never blow a small picture up: a 48x48 sticker stretched across the
+    // window is worse than a small one.
+    let natural_cols = (w / CELL_W).max(1) as u16;
+    let mut cols = natural_cols.min(max_cols);
+    let mut rows = cells_tall(w, h, cols);
+    if rows > max_rows {
+        // Too tall: fix the height and work the width back out.
+        rows = max_rows;
+        cols = ((u32::from(rows) * CELL_H * w) / (h * CELL_W)).max(1) as u16;
+        cols = cols.min(max_cols);
+    }
+    (cols.max(1), rows.max(1))
+}
+
+fn cells_tall(w: u32, h: u32, cols: u16) -> u16 {
+    ((u32::from(cols) * CELL_W * h) / (w * CELL_H)).max(1) as u16
+}
+
+fn human_bytes(n: u32) -> String {
+    if n < 1024 {
+        format!("{n} B")
+    } else if n < 1024 * 1024 {
+        format!("{} KB", n / 1024)
+    } else {
+        format!("{:.1} MB", n as f32 / (1024.0 * 1024.0))
+    }
+}
+
+/// What a picture turns into on screen this frame.
+enum Framed {
+    /// A single line of text standing in for the picture.
+    Line(String),
+    /// Room reserved for pixels, painted after the text.
+    Open { cols: u16, rows: u16 },
+}
+
+/// Decides how a picture shows up, which is where the disguise is enforced:
+/// under `F12` a picture can only ever be a line of text, no matter what the
+/// user opened before pressing it.
+fn frame_image(app: &App, img: &ImageRef, key: ([u8; 32], u64)) -> Framed {
+    let size = format!("{}x{}", img.w, img.h);
+    if app.masked {
+        // Reads as a multimodal prompt rather than as a chat attachment.
+        return Framed::Line(format!("image input  {size}"));
+    }
+    if app.hidden.contains(&key) {
+        return Framed::Line(format!("image (+)  {size}  hidden"));
+    }
+    if !app.expanded.contains(&key) {
+        return Framed::Line(format!(
+            "image (+)  {size}  {}  {}",
+            human_bytes(img.bytes),
+            img.kind.label()
+        ));
+    }
+    match app.shots.get(&img.blob) {
+        Some(shot) => Framed::Open {
+            cols: shot.for_area.width,
+            rows: shot.rows(),
+        },
+        // Opened, but the pixels are not here. Says so instead of leaving a
+        // hole where a picture should be.
+        None => Framed::Line(format!("image (-)  {size}  waiting for pixels…")),
     }
 }
 
@@ -2145,6 +2733,8 @@ fn build_lines(app: &App, width: u16) -> Transcript {
         lines: Vec::new(),
         owners: Vec::new(),
         actions: None,
+        images: Vec::new(),
+        toggles: Vec::new(),
     };
     let mut last_day: Option<(i32, u8, u8)> = None;
     // A year-old room must not make every keystroke reformat tens of thousands
@@ -2183,6 +2773,7 @@ fn build_lines(app: &App, width: u16) -> Transcript {
                 ts,
                 reply_to,
                 whisper,
+                image,
             } => {
                 // A whisper is the most sensitive thing on screen, so the
                 // disguise drops it entirely rather than relabelling it.
@@ -2310,6 +2901,37 @@ fn build_lines(app: &App, width: u16) -> Transcript {
                             Some(idx),
                         );
                     }
+                    if let Some(img) = image {
+                        match frame_image(app, img, (*author, *seq)) {
+                            Framed::Line(text) => {
+                                let pad = indent(edge, text.chars().count());
+                                if !app.masked {
+                                    sink.toggles.push((sink.lines.len(), idx));
+                                }
+                                sink.push(
+                                    Line::from(Span::styled(pad + &text, dim())),
+                                    Some(idx),
+                                );
+                            }
+                            Framed::Open { cols, rows } => {
+                                let shut = format!("image (-)  {}x{}", img.w, img.h);
+                                let pad = indent(edge, shut.chars().count());
+                                sink.toggles.push((sink.lines.len(), idx));
+                                sink.push(Line::from(Span::styled(pad + &shut, dim())), Some(idx));
+                                let first_line = sink.lines.len();
+                                for _ in 0..rows {
+                                    sink.blank(Some(idx));
+                                }
+                                sink.images.push(ImageSlot {
+                                    first_line,
+                                    blob: img.blob,
+                                    rows,
+                                    // Hugs the right edge, like the text above it.
+                                    col: (edge as u16).saturating_sub(cols),
+                                });
+                            }
+                        }
+                    }
                 } else {
                     if let Some(quote) = &quote {
                         sink.push(
@@ -2339,6 +2961,38 @@ fn build_lines(app: &App, width: u16) -> Transcript {
                             Some(idx),
                         );
                     }
+                    if let Some(img) = image {
+                        match frame_image(app, img, (*author, *seq)) {
+                            Framed::Line(text) => {
+                                if !app.masked {
+                                    sink.toggles.push((sink.lines.len(), idx));
+                                }
+                                sink.push(
+                                    Line::from(Span::styled(format!("  {text}"), dim())),
+                                    Some(idx),
+                                );
+                            }
+                            // Left edge, so the width does not come into it.
+                            Framed::Open { cols: _, rows } => {
+                                let shut = format!("image (-)  {}x{}", img.w, img.h);
+                                sink.toggles.push((sink.lines.len(), idx));
+                                sink.push(
+                                    Line::from(Span::styled(format!("  {shut}"), dim())),
+                                    Some(idx),
+                                );
+                                let first_line = sink.lines.len();
+                                for _ in 0..rows {
+                                    sink.blank(Some(idx));
+                                }
+                                sink.images.push(ImageSlot {
+                                    first_line,
+                                    blob: img.blob,
+                                    rows,
+                                    col: 2,
+                                });
+                            }
+                        }
+                    }
                 }
                 // The trailing blank belongs to the message above it, so the
                 // pointer does not flicker in the gap between messages.
@@ -2350,6 +3004,8 @@ fn build_lines(app: &App, width: u16) -> Transcript {
         lines: sink.lines,
         owners: sink.owners,
         actions: sink.actions,
+        images: sink.images,
+        toggles: sink.toggles,
     }
 }
 
@@ -2566,6 +3222,238 @@ mod tests {
         app.feed.push(from_peer(author, seq, name, body));
     }
 
+    /// A picture somebody sent, for tests that only care about layout. The
+    /// blob is a name, not bytes -- nothing here needs to decode.
+    fn push_picture(app: &mut App, author: [u8; 32], seq: u64, name: &str) -> ([u8; 32], u64) {
+        app.by_key.insert((author, seq), app.feed.len());
+        app.feed.push(Feed::Msg {
+            author,
+            seq,
+            name: name.into(),
+            mine: false,
+            body: String::new(),
+            ts: now_ts(),
+            reply_to: None,
+            whisper: None,
+            image: Some(Box::new(ImageRef {
+                blob: [0x5a; 32],
+                w: 320,
+                h: 240,
+                kind: ImageKind::Png,
+                bytes: 62_000,
+            })),
+        });
+        (author, seq)
+    }
+
+    #[tokio::test]
+    async fn a_picture_arrives_closed_and_only_opens_when_asked() {
+        let mut h = Harness::new();
+        h.cmd("/new sala").await;
+        let key = push_picture(&mut h.app, [9u8; 32], 1, "Dale");
+
+        let closed = h.painted();
+        assert!(closed.contains("image (+)"), "should offer to open it");
+        assert!(closed.contains("320x240"), "and say what it is");
+        assert!(
+            !closed.contains("image (-)"),
+            "nothing should be open on arrival"
+        );
+        assert!(
+            h.app.rendered.as_ref().unwrap().layout.images.is_empty(),
+            "a closed picture must not reserve any room"
+        );
+
+        // Opening is what puts it on screen. There are no pixels behind this
+        // blob, so it stops at "waiting" -- which is itself the behaviour we
+        // want when the bytes have not caught up with the announcement.
+        let last = h.app.feed.len() - 1;
+        toggle_expanded(&mut h.app, last).await;
+        assert!(h.app.expanded.contains(&key));
+        assert!(
+            h.painted().contains("waiting for pixels"),
+            "an opened picture with no bytes has to say so, not leave a hole"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_disguise_closes_every_picture() {
+        let mut h = Harness::new();
+        h.cmd("/new sala").await;
+        let key = push_picture(&mut h.app, [9u8; 32], 1, "Dale");
+
+        // Force it open, including the state that survives a redraw.
+        h.app.expanded.insert(key);
+        h.app.expanded_rev += 1;
+        h.app.shots.insert(
+            [0x5a; 32],
+            Shot {
+                frames: Vec::new(),
+                delays: Vec::new(),
+                at: 0,
+                next: None,
+                for_area: ratatui::layout::Size::new(20, 10),
+            },
+        );
+
+        h.app.masked = true;
+        let masked = h.painted();
+        assert!(
+            !masked.contains("image (-)"),
+            "F12 has to close every picture, not just the ones nobody opened"
+        );
+        assert!(
+            h.app.rendered.as_ref().unwrap().layout.images.is_empty(),
+            "no room may be reserved for pixels while the disguise is on"
+        );
+        assert!(
+            masked.contains("image input"),
+            "it should read as a multimodal prompt, not as a chat attachment"
+        );
+        assert!(
+            h.app.rendered.as_ref().unwrap().layout.toggles.is_empty(),
+            "and there must be nothing to click that would reopen it"
+        );
+
+        // Turning the disguise off leaves the earlier choice intact.
+        h.app.masked = false;
+        assert!(h.app.expanded.contains(&key), "F12 hides, it does not forget");
+    }
+
+    /// A real shot with `n` encoded frames, already due to advance. Built
+    /// through the same picker the app uses, so the test exercises the actual
+    /// encode path rather than a stand-in.
+    fn animated_shot(n: usize) -> Shot {
+        let picker = picker_for(ImageProto::Halfblocks);
+        let area = ratatui::layout::Size::new(8, 4);
+        let frames: Vec<SlicedProtocol> = (0..n)
+            .map(|i| {
+                let mut img = image::RgbaImage::new(16, 16);
+                for px in img.pixels_mut() {
+                    *px = image::Rgba([(i * 40) as u8, 100, 150, 255]);
+                }
+                SlicedProtocol::new_with_resize(
+                    &picker,
+                    image::DynamicImage::ImageRgba8(img),
+                    area,
+                    ratatui_image::Resize::Fit(None),
+                )
+                .unwrap()
+            })
+            .collect();
+        Shot {
+            frames,
+            delays: vec![40; n],
+            at: 0,
+            // Already overdue, so a single tick has to act.
+            next: Some(Instant::now() - Duration::from_millis(1)),
+            for_area: area,
+        }
+    }
+
+    #[tokio::test]
+    async fn an_animation_only_runs_while_it_can_be_seen() {
+        let mut h = Harness::new();
+        h.cmd("/new sala").await;
+        let blob = [0x5a; 32];
+        h.app.shots.insert(blob, animated_shot(3));
+
+        // Off screen: a gif scrolled out of view must neither advance nor ask
+        // to be woken, or it burns cpu for nobody.
+        h.app.on_screen.clear();
+        tick_animations(&mut h.app);
+        assert_eq!(h.app.shots[&blob].at, 0, "must not advance unseen");
+        assert!(next_frame_due(&h.app).is_none(), "must not schedule unseen");
+
+        // On screen: it advances, wraps around, and keeps asking.
+        h.app.on_screen = vec![blob];
+        tick_animations(&mut h.app);
+        assert_eq!(h.app.shots[&blob].at, 1, "a due frame should advance");
+        assert!(next_frame_due(&h.app).is_some(), "and schedule the next");
+
+        for expected in [2usize, 0, 1] {
+            h.app.shots.get_mut(&blob).unwrap().next =
+                Some(Instant::now() - Duration::from_millis(1));
+            tick_animations(&mut h.app);
+            assert_eq!(h.app.shots[&blob].at, expected, "should loop round");
+        }
+
+        // The disguise stops the clock, not just the drawing.
+        h.app.masked = true;
+        assert!(
+            next_frame_due(&h.app).is_none(),
+            "F12 must stop the clock, not merely hide the picture"
+        );
+        let before = h.app.shots[&blob].at;
+        h.app.shots.get_mut(&blob).unwrap().next = Some(Instant::now() - Duration::from_millis(1));
+        tick_animations(&mut h.app);
+        assert_eq!(h.app.shots[&blob].at, before, "and must not advance either");
+    }
+
+    #[tokio::test]
+    async fn a_late_frame_does_not_cascade_through_the_rest() {
+        let mut h = Harness::new();
+        h.cmd("/new sala").await;
+        let blob = [0x5a; 32];
+        let mut shot = animated_shot(5);
+        // The loop was blocked for a second: four frames' worth of deadlines
+        // went by while nothing ran.
+        shot.next = Some(Instant::now() - Duration::from_secs(1));
+        h.app.shots.insert(blob, shot);
+        h.app.on_screen = vec![blob];
+
+        tick_animations(&mut h.app);
+        assert_eq!(
+            h.app.shots[&blob].at, 1,
+            "one tick advances exactly one frame, however late it was"
+        );
+        let next = h.app.shots[&blob].next.expect("should still be scheduled");
+        assert!(
+            next > Instant::now() + Duration::from_millis(25),
+            "the next frame must be a full delay from now, not from the deadline it missed              -- otherwise a stalled loop replays the whole gif in one burst"
+        );
+    }
+
+    /// A still picture has one frame and must never wake the loop at all.
+    #[tokio::test]
+    async fn a_still_picture_never_schedules_anything() {
+        let mut h = Harness::new();
+        h.cmd("/new sala").await;
+        let blob = [0x5a; 32];
+        h.app.shots.insert(blob, animated_shot(1));
+        h.app.on_screen = vec![blob];
+
+        assert!(!h.app.shots[&blob].animated());
+        tick_animations(&mut h.app);
+        assert_eq!(h.app.shots[&blob].at, 0);
+        assert!(
+            next_frame_due(&h.app).is_none(),
+            "a still picture must leave the app idle"
+        );
+    }
+
+    #[test]
+    fn a_picture_keeps_its_shape_inside_the_space_it_gets() {
+        // Wider than tall, plenty of room: bounded by width.
+        let (cols, rows) = fit_cells(800, 400, 40, 20);
+        assert!(cols <= 40 && rows <= 20, "{cols}x{rows}");
+        assert!(rows >= 1);
+
+        // Tall and narrow: the height limit is what binds, and the width has
+        // to come down with it or the picture stretches.
+        let (cols, rows) = fit_cells(400, 4000, 40, 20);
+        assert_eq!(rows, 20);
+        assert!(cols < 40, "a tall picture must not fill the width: {cols}");
+
+        // A sticker is not blown up to fill the window.
+        let (cols, _) = fit_cells(48, 48, 60, 20);
+        assert!(cols <= 6, "small pictures stay small, got {cols}");
+
+        // Degenerate input must not panic or divide by zero.
+        assert_eq!(fit_cells(0, 0, 40, 20), (0, 0));
+        assert_eq!(fit_cells(100, 100, 0, 20), (0, 0));
+    }
+
     /// A message from somebody else, for tests that only care about layout.
     fn from_peer(author: [u8; 32], seq: u64, name: &str, body: &str) -> Feed {
         Feed::Msg {
@@ -2577,6 +3465,7 @@ mod tests {
             ts: now_ts(),
             reply_to: None,
             whisper: None,
+            image: None,
         }
     }
 
@@ -3030,6 +3919,7 @@ mod tests {
             ts: now_ts(),
             reply_to: None,
             whisper: Some(me),
+            image: None,
         });
 
         let shown: String = build_lines(&h.app, 80).lines.iter().map(flatten).collect();
@@ -3286,6 +4176,7 @@ mod tests {
             ts: now_ts(),
             reply_to: None,
             whisper: Some(me),
+            image: None,
         });
         push_peer(&mut h.app, [9u8; 32], 11, "Dale", "e aquele cliente chato de novo");
         let heavy = h.app.feed.len() - 1;

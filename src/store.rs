@@ -70,6 +70,63 @@ pub enum Record {
         ts: u64,
         sig: Vec<u8>,
     },
+    /// A picture. Only the description travels in the log -- the pixels live
+    /// in a blob fetched over its own stream. Inlining them would be two
+    /// separate disasters: the sync reads a whole batch of records with a 2 MB
+    /// cap and swallows the error, so one big picture would silently stop
+    /// *text* from arriving; and the log is held in memory in full, so a few
+    /// screenshots would be re-read on every open forever.
+    Image {
+        author: [u8; 32],
+        seq: u64,
+        ts: u64,
+        name: String,
+        /// blake3 of the original bytes. Names the blob and proves on arrival
+        /// that what we got is what was sent.
+        blob: [u8; 32],
+        w: u32,
+        h: u32,
+        kind: ImageKind,
+        bytes: u32,
+        /// Text typed alongside the picture. Empty when there was none.
+        caption: String,
+        reply_to: Option<([u8; 32], u64)>,
+        sig: Vec<u8>,
+    },
+}
+
+/// What the bytes decode as. Kept narrow on purpose: every extra format is
+/// another decoder in the binary and another parser exposed to whatever a
+/// peer sends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ImageKind {
+    Png,
+    Jpeg,
+    Gif,
+}
+
+impl ImageKind {
+    /// Sniffs the format from the leading bytes. We never trust a file
+    /// extension for this -- the bytes are what the decoder will see.
+    pub fn sniff(bytes: &[u8]) -> Option<Self> {
+        if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]) {
+            Some(ImageKind::Png)
+        } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+            Some(ImageKind::Jpeg)
+        } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+            Some(ImageKind::Gif)
+        } else {
+            None
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            ImageKind::Png => "png",
+            ImageKind::Jpeg => "jpeg",
+            ImageKind::Gif => "gif",
+        }
+    }
 }
 
 impl Record {
@@ -88,7 +145,8 @@ impl Record {
             Record::Chat { author, seq, .. }
             | Record::ChatNamed { author, seq, .. }
             | Record::Post { author, seq, .. }
-            | Record::Whisper { author, seq, .. } => Some((*author, *seq)),
+            | Record::Whisper { author, seq, .. }
+            | Record::Image { author, seq, .. } => Some((*author, *seq)),
             Record::Meta { .. } | Record::Identity { .. } | Record::Presence { .. } => None,
         }
     }
@@ -100,6 +158,8 @@ impl Record {
             Record::Chat { body, .. }
             | Record::ChatNamed { body, .. }
             | Record::Post { body, .. } => Some(body),
+            // The caption is the only readable text a picture carries.
+            Record::Image { caption, .. } => Some(caption),
             Record::Meta { .. }
             | Record::Identity { .. }
             | Record::Whisper { .. }
@@ -114,14 +174,23 @@ impl Record {
             | Record::Post { author, .. }
             | Record::Whisper { author, .. }
             | Record::Identity { author, .. }
-            | Record::Presence { author, .. } => Some(author),
+            | Record::Presence { author, .. }
+            | Record::Image { author, .. } => Some(author),
             Record::Meta { .. } => None,
         }
     }
 
     pub fn reply_to(&self) -> Option<([u8; 32], u64)> {
         match self {
-            Record::Post { reply_to, .. } => *reply_to,
+            Record::Post { reply_to, .. } | Record::Image { reply_to, .. } => *reply_to,
+            _ => None,
+        }
+    }
+
+    /// The blob this record needs before it can be shown, if any.
+    pub fn wants_blob(&self) -> Option<[u8; 32]> {
+        match self {
+            Record::Image { blob, .. } => Some(*blob),
             _ => None,
         }
     }
@@ -151,6 +220,23 @@ pub struct Settings {
     /// Whether a newline arriving in a burst is treated as part of a pasted
     /// message. Turn it off and Enter always sends, full stop.
     pub paste_detect: bool,
+    /// How this terminal draws pictures. Worked out once and written down:
+    /// the detection has to talk to the terminal over stdin, which is only
+    /// safe before the input thread starts reading it, so we get exactly one
+    /// chance per install rather than one per launch.
+    pub image_proto: ImageProto,
+}
+
+/// Which graphics protocol to draw with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum ImageProto {
+    /// Not worked out yet. Triggers the one-time detection on next start.
+    #[default]
+    Unknown,
+    /// Real pixels. Windows Terminal 1.22 and up.
+    Sixel,
+    /// Unicode half-blocks: two pixels per cell, works in any terminal.
+    Halfblocks,
 }
 
 impl Default for Settings {
@@ -159,6 +245,7 @@ impl Default for Settings {
             notify: Notify::default(),
             snooze_until: 0,
             paste_detect: true,
+            image_proto: ImageProto::Unknown,
         }
     }
 }
@@ -505,6 +592,116 @@ impl RoomLog {
         self.key.open(&sealed).ok()
     }
 
+    fn blob_dir(&self) -> PathBuf {
+        self.path.with_file_name("blobs")
+    }
+
+    fn blob_path(&self, hash: &[u8; 32]) -> PathBuf {
+        self.blob_dir().join(format!("{}.bin", topic_hex(hash)))
+    }
+
+    pub fn has_blob(&self, hash: &[u8; 32]) -> bool {
+        self.blob_path(hash).exists()
+    }
+
+    /// Picture bytes, sealed with the room key like everything else here. A
+    /// screenshot of a payslip deserves the same protection as the sentence
+    /// describing it.
+    pub fn write_blob(&self, hash: &[u8; 32], plain: &[u8]) -> Result<()> {
+        let dir = self.blob_dir();
+        fs::create_dir_all(&dir).context("create blob dir")?;
+        let sealed = self.key.seal(plain)?;
+        let path = self.blob_path(hash);
+        // Staged then renamed, so a half-written blob can never be read as a
+        // whole one -- the same trick `rewrite` uses for the log.
+        let staging = path.with_extension("new");
+        fs::write(&staging, &sealed).context("write blob")?;
+        fs::rename(&staging, &path).context("commit blob")?;
+        Ok(())
+    }
+
+    /// Absent, corrupt or sealed with another key all read as "not here".
+    /// A blob we cannot open is one we should fetch again, not one that
+    /// should stop the room from opening.
+    pub fn read_blob(&self, hash: &[u8; 32]) -> Option<Vec<u8>> {
+        let sealed = fs::read(self.blob_path(hash)).ok()?;
+        let plain = self.key.open(&sealed).ok()?;
+        // The name is the hash of the content, so this catches a blob that
+        // decrypted cleanly but is not what it claims to be.
+        (blake3::hash(&plain).as_bytes() == hash).then_some(plain)
+    }
+
+    /// The blob exactly as it sits on disk, still sealed. Serving it this way
+    /// means a peer passing a picture along never decrypts it.
+    pub fn read_blob_sealed(&self, hash: &[u8; 32]) -> Option<Vec<u8>> {
+        fs::read(self.blob_path(hash)).ok()
+    }
+
+    /// Takes a sealed blob from a peer. Opens it, checks the content against
+    /// the name we asked for, and only then files it. Answers whether it was
+    /// kept -- a mismatch is somebody sending us something we did not ask for,
+    /// not an error worth tearing the session down over.
+    pub fn accept_blob(&self, hash: &[u8; 32], sealed: &[u8]) -> bool {
+        let Ok(plain) = self.key.open(sealed) else {
+            return false;
+        };
+        if blake3::hash(&plain).as_bytes() != hash {
+            return false;
+        }
+        self.write_blob(hash, &plain).is_ok()
+    }
+
+    /// Pictures announced in the log whose pixels have not arrived yet, newest
+    /// first. Newest first because that is what somebody is about to scroll
+    /// to; a screenshot from last week can wait its turn.
+    pub fn missing_blobs(&self) -> Vec<[u8; 32]> {
+        let mut want = Vec::new();
+        for hash in self.records.iter().rev().filter_map(Record::wants_blob) {
+            if !want.contains(&hash) && !self.has_blob(&hash) {
+                want.push(hash);
+            }
+        }
+        want
+    }
+
+    /// Drops the least recently used blobs until the folder fits `limit`.
+    /// Returns how many went. The `Record` stays either way: the conversation
+    /// keeps its shape, and the line just reads as unavailable.
+    pub fn prune_blobs(&self, limit: u64) -> Result<usize> {
+        let dir = self.blob_dir();
+        if !dir.exists() {
+            return Ok(0);
+        }
+        let mut held: Vec<(std::time::SystemTime, u64, PathBuf)> = fs::read_dir(&dir)?
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                let meta = entry.metadata().ok()?;
+                if !meta.is_file() {
+                    return None;
+                }
+                let used = meta.accessed().or_else(|_| meta.modified()).ok()?;
+                Some((used, meta.len(), entry.path()))
+            })
+            .collect();
+        let mut total: u64 = held.iter().map(|(_, len, _)| *len).sum();
+        if total <= limit {
+            return Ok(0);
+        }
+        // Oldest first, so the ones nobody has looked at in a while go first.
+        held.sort_by_key(|(used, _, _)| *used);
+        let mut dropped = 0;
+        for (_, len, path) in held {
+            if total <= limit {
+                break;
+            }
+            if fs::remove_file(&path).is_ok() {
+                total = total.saturating_sub(len);
+                dropped += 1;
+            }
+        }
+        Ok(dropped)
+    }
+
     pub fn alias(&self) -> Option<String> {
         self.records.iter().rev().find_map(|r| match r {
             Record::Meta { alias } => Some(alias.clone()),
@@ -710,6 +907,142 @@ mod tests {
             }),
             6
         );
+        assert_eq!(
+            tag(Record::Image {
+                author: [0; 32],
+                seq: 0,
+                ts: 0,
+                name: String::new(),
+                blob: [0; 32],
+                w: 0,
+                h: 0,
+                kind: ImageKind::Png,
+                bytes: 0,
+                caption: String::new(),
+                reply_to: None,
+                sig: blank(),
+            }),
+            7
+        );
+    }
+
+    #[test]
+    fn a_picture_is_deduplicated_like_any_other_message() {
+        let tmp = TempDir::new().unwrap();
+        let dir = DataDir::from_path(tmp.path().to_path_buf()).unwrap();
+        let pin = Pin::parse("7K2M-9QXP").unwrap();
+        let mut log = RoomLog::open_or_create(&dir, &pin, Some("sala")).unwrap();
+
+        let shot = Record::Image {
+            author: [7; 32],
+            seq: 0,
+            ts: 1,
+            name: "Pedro".into(),
+            blob: [9; 32],
+            w: 320,
+            h: 240,
+            kind: ImageKind::Png,
+            bytes: 62_000,
+            caption: String::new(),
+            reply_to: None,
+            sig: vec![1, 2, 3],
+        };
+        assert!(log.append(shot.clone()).unwrap(), "first copy lands");
+        assert!(!log.append(shot).unwrap(), "the sync resends it forever");
+
+        // It shares the author's sequence with text, so the next message
+        // cannot silently reuse the slot.
+        assert_eq!(log.next_seq_for(&[7; 32]), 1);
+    }
+
+    #[test]
+    fn blobs_are_sealed_and_verified_against_their_name() {
+        let tmp = TempDir::new().unwrap();
+        let dir = DataDir::from_path(tmp.path().to_path_buf()).unwrap();
+        let pin = Pin::parse("7K2M-9QXP").unwrap();
+        let log = RoomLog::open_or_create(&dir, &pin, Some("sala")).unwrap();
+
+        let pixels = b"nao sao pixels de verdade, mas servem".to_vec();
+        let hash = *blake3::hash(&pixels).as_bytes();
+        assert!(!log.has_blob(&hash));
+        log.write_blob(&hash, &pixels).unwrap();
+        assert!(log.has_blob(&hash));
+        assert_eq!(log.read_blob(&hash).as_deref(), Some(pixels.as_slice()));
+
+        // Nothing readable on disk: a screenshot is as sensitive as the
+        // sentence describing it.
+        let raw = fs::read(log.blob_path(&hash)).unwrap();
+        assert!(
+            !raw.windows(4).any(|w| w == b"pixe"),
+            "blob went to disk in the clear"
+        );
+
+        // A blob whose content stopped matching its name is not the blob we
+        // asked for, even if it decrypts.
+        let lie = [0xab; 32];
+        log.write_blob(&lie, &pixels).unwrap();
+        assert_eq!(log.read_blob(&lie), None, "content must match the hash");
+    }
+
+    #[test]
+    fn a_peer_cannot_answer_with_pixels_we_did_not_ask_for() {
+        let tmp = TempDir::new().unwrap();
+        let dir = DataDir::from_path(tmp.path().to_path_buf()).unwrap();
+        let pin = Pin::parse("7K2M-9QXP").unwrap();
+        let log = RoomLog::open_or_create(&dir, &pin, Some("sala")).unwrap();
+
+        let wanted = b"a imagem que pedimos".to_vec();
+        let hash = *blake3::hash(&wanted).as_bytes();
+        let sealed = log.key.seal(&wanted).unwrap();
+        assert!(log.accept_blob(&hash, &sealed), "the real thing is kept");
+
+        // Right key, wrong content: somebody answering our request with
+        // something else entirely.
+        let other = log.key.seal(b"uma imagem completamente diferente").unwrap();
+        let elsewhere = TempDir::new().unwrap();
+        let dir2 = DataDir::from_path(elsewhere.path().to_path_buf()).unwrap();
+        let fresh = RoomLog::open_or_create(&dir2, &pin, Some("sala")).unwrap();
+        assert!(
+            !fresh.accept_blob(&hash, &other),
+            "content that is not what we asked for must be refused"
+        );
+        assert!(!fresh.has_blob(&hash), "and must not reach the disk");
+
+        // Sealed with a key from another room: unreadable, and not ours.
+        let stranger = RoomKey::derive(&Pin::parse("KKKK-MMMM").unwrap()).unwrap();
+        assert!(
+            !fresh.accept_blob(&hash, &stranger.seal(&wanted).unwrap()),
+            "a blob from another room must not open here"
+        );
+    }
+
+    #[test]
+    fn pruning_drops_the_oldest_blobs_until_it_fits() {
+        let tmp = TempDir::new().unwrap();
+        let dir = DataDir::from_path(tmp.path().to_path_buf()).unwrap();
+        let pin = Pin::parse("7K2M-9QXP").unwrap();
+        let log = RoomLog::open_or_create(&dir, &pin, Some("sala")).unwrap();
+
+        let mut names = Vec::new();
+        for n in 0u8..4 {
+            let body = vec![n; 4096];
+            let hash = *blake3::hash(&body).as_bytes();
+            log.write_blob(&hash, &body).unwrap();
+            names.push(hash);
+            // The pruner orders by access time; without a gap the four files
+            // can land on the same tick and the order becomes arbitrary.
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(names.iter().all(|h| log.has_blob(h)));
+
+        // Room for roughly two of them.
+        let dropped = log.prune_blobs(9_000).unwrap();
+        assert!(dropped >= 2, "expected at least two to go, went {dropped}");
+        assert!(!log.has_blob(&names[0]), "the oldest should go first");
+        assert!(log.has_blob(&names[3]), "the newest should survive");
+
+        // Under the limit it must not touch anything.
+        assert_eq!(log.prune_blobs(u64::MAX).unwrap(), 0);
     }
 
     #[test]

@@ -1,4 +1,5 @@
 mod crypto;
+mod media;
 mod net;
 mod room;
 mod store;
