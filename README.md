@@ -45,6 +45,7 @@ com um Enter. `locked` pede a chave.
 | `/lock` | para de guardar a chave nesta máquina |
 | `/forget` | apaga a sala desta máquina — abre tela de confirmação |
 | `/diag` | estado da rede quando ninguém aparece |
+| `/update` | procura uma versão nova, pergunta, e instala se você quiser |
 | `/help` | tela de ajuda (também em `F1`) |
 | `/quit` | sai |
 
@@ -287,6 +288,63 @@ O exe sai em `target\release\local-llm.exe`. Alvo: &lt; 8 MB.
 ```powershell
 Compress-Archive -Path target\release\local-llm.exe -DestinationPath local-llm-0.5.0-windows-x64.zip -Force
 ```
+
+## Atualizar
+
+```
+/update
+```
+
+Ele olha o release mais novo, compara com o que você tem e **pergunta** antes de
+qualquer coisa. Aceitando: baixa, confere, troca o executável, reinicia e volta
+pra sala em que você estava.
+
+Isso é a única coisa no app que fala com fora da LAN, e **só** quando você
+digita o comando. Não há checagem automática ao abrir.
+
+O motivo de existir não é preguiça. Baixar o `.exe` pelo navegador faz o Windows
+carimbar o arquivo como vindo da internet, e aí o SmartScreen entra na frente
+com o "More info → Run anyway". Arquivo escrito por um programa **não** leva
+esse carimbo — então o app baixando o próprio binário elimina aquela parede.
+
+O que **não** elimina: o antivírus da empresa ainda analisa o exe uma vez. Isso
+só sai com certificado de assinatura ou com a TI colocando o app na allowlist —
+nenhum dos dois está na nossa mão.
+
+### Por que é seguro deixar o app se atualizar
+
+Duas verificações independentes, que pegam coisas diferentes:
+
+- **sha256** — download truncado ou corrompido.
+- **assinatura Ed25519** — download inteiro, mas vindo das mãos erradas. O TLS
+  do GitHub prova que os bytes chegaram sem alteração; **não** prova que o
+  GitHub estava servindo o nosso binário. Só roda o que foi assinado com a
+  chave de release, cuja metade pública está dentro do exe.
+
+Falhando qualquer uma, os bytes não chegam a virar arquivo executável.
+
+A troca usa a única brecha que o Windows deixa: não dá para sobrescrever um exe
+rodando, mas dá para renomeá-lo. O que está rodando sai como `.old`, o novo
+assume o nome, e é lançado; ele varre o `.old` na primeira execução. Se o
+segundo passo falhar, o antigo volta ao lugar — a máquina nunca fica sem
+executável.
+
+Voltar pra sala grava **só o identificador da sala, nunca a chave**. Sala com
+chave lembrada reabre sozinha; sala trancada para na tela de chave, que é o
+certo — um restart não pode tirar alguém da conversa em silêncio.
+
+### Publicar uma versão (quem mantém)
+
+```powershell
+.\scripts\publish-release.ps1 -KeyFile $HOME\local-llm-release.key
+# quando o formato de rede muda e as versões velhas não conectam mais:
+.\scripts\publish-release.ps1 -KeyFile $HOME\local-llm-release.key -MinVersion 0.6.0
+```
+
+Ele roda testes e clippy, builda, assina, e **recusa publicar se a chave não for
+a mesma embutida no app** — errar isso seria publicar algo que ninguém instala.
+A chave privada é lida do arquivo e descartada; não passa pelo console nem pelo
+repositório. `-DryRun` mostra tudo sem taggear nem subir.
 
 ## Como compartilhar
 

@@ -27,7 +27,7 @@ rand = "0.8"
 # Already compiled in the tree via iroh. Taken directly so /update can
 # fetch a release itself -- a file written by a program carries no Mark
 # of the Web, which is what keeps SmartScreen out of the way.
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 # Already in the tree via iroh's TLS. Taken directly for the one sha256
 # the project needs: the digest published alongside a release.
 ring = "0.17"
