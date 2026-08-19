@@ -96,8 +96,6 @@ $pub = (Get-Content "$out\pub.txt" -Raw).Trim()
 
 # The app only runs binaries signed by the key baked into it. Catching a
 # mismatch here beats shipping a release nobody can install.
-$embedded = (Select-String -Path 'src\update.rs' -Pattern '0x([0-9a-f]{2})' -AllMatches |
-    Select-Object -First 1).Matches | ForEach-Object { $_.Groups[1].Value }
 $src = Get-Content 'src\update.rs' -Raw
 if ($src -match '(?s)RELEASE_PUBKEY:\s*\[u8;\s*32\]\s*=\s*\[(.*?)\];') {
     $bytes = [regex]::Matches($Matches[1], '0x([0-9a-fA-F]{2})') | ForEach-Object { $_.Groups[1].Value }
