@@ -15,7 +15,7 @@ chacha20poly1305 = "0.10"
 # Already in the tree via iroh; taken as a direct dependency so whispers can do
 # X25519 without pulling a second copy of the curve in.
 curve25519-dalek = "5"
-crossterm = "0.28"
+crossterm = "0.29"
 data-encoding = "2"
 directories = "6"
 futures-lite = "2"
@@ -24,7 +24,7 @@ iroh-gossip = "0.101"
 iroh-mdns-address-lookup = "0.4"
 postcard = { version = "1", default-features = false, features = ["alloc", "use-std"] }
 rand = "0.8"
-ratatui = "0.29"
+ratatui = "0.30"
 serde = { version = "1", features = ["derive"] }
 time = { version = "0.3", default-features = false, features = ["std", "local-offset"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
