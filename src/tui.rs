@@ -298,6 +298,10 @@ pub struct App {
     proto: ImageProto,
     /// Set by a click on the picture line, consumed by the event loop.
     pending_expand: Option<usize>,
+    /// Who the next message goes to privately. Set by `/w` and held until
+    /// Esc, because the alternative -- retyping `/w` every line -- is how a
+    /// private sentence ends up in the room.
+    whispering: Option<[u8; 32]>,
     /// Blobs actually painted last frame. An animation nobody can see must
     /// not keep waking the loop, and scrolling a gif off the top is the
     /// commonest way for that to happen.
@@ -423,6 +427,7 @@ impl App {
             proto,
             pending_expand: None,
             on_screen: Vec::new(),
+            whispering: None,
         };
         app.refresh_sessions();
         Ok(app)
@@ -479,6 +484,13 @@ impl App {
         self.replying = None;
         self.hidden.clear();
         self.hidden_rev += 1;
+        // Nobody from the last room can be whispered to from this one, and a
+        // prompt still pointing at them would be a lie.
+        self.whispering = None;
+        self.expanded.clear();
+        self.expanded_rev += 1;
+        self.shots.clear();
+        self.on_screen.clear();
         self.unread = 0;
         self.follow = true;
         self.scroll = 0;
@@ -1511,17 +1523,22 @@ async fn handle_chat<B: Backend>(
     let page = 6u16;
     match key.code {
         KeyCode::Esc => {
-            // Unwinds one step at a time: the armed reply first, then the line.
+            // Unwinds one step at a time: the armed reply, then the line, then
+            // the whisper the prompt is pointed at. Leaving the whisper for
+            // last means a half-typed private line is never sent to the room
+            // by one keystroke too many -- clearing it comes first.
             if app.replying.is_some() {
                 app.replying = None;
                 app.picked = None;
                 app.status = CHAT_HINT.into();
             } else if app.picked.is_some() {
                 app.picked = None;
-            } else if app.input.text.is_empty() {
-                app.status = "/leave goes back to the session list".into();
-            } else {
+            } else if !app.input.text.is_empty() {
                 app.input.clear();
+            } else if app.whispering.take().is_some() {
+                app.status = "back to the room".into();
+            } else {
+                app.status = "/leave goes back to the session list".into();
             }
         }
         KeyCode::Tab => complete_nick(app),
@@ -1607,6 +1624,11 @@ fn whisper_being_answered(app: &App) -> Option<[u8; 32]> {
 }
 
 async fn send(app: &mut App, body: String) {
+    // The prompt says where this is going, and it is the prompt that decides.
+    if let Some(them) = app.whispering {
+        send_whisper(app, them, body).await;
+        return;
+    }
     // Answering a whisper out loud is refused, and this is the one place that
     // can tell. The danger is not that the room reads the whisper -- it
     // cannot, the quote degrades to "not here yet" for anyone who cannot open
@@ -2470,11 +2492,24 @@ async fn whisper_cmd(app: &mut App, line: &str) {
         }
         return;
     };
+    let text = text.to_string();
+    // `/w <name>` with nothing after it just points the prompt at them. That
+    // is the whole feature: you say who once, not once per sentence.
     if text.is_empty() {
-        app.status = "usage: /w <name> <message>   (tab completes the name)".into();
+        let who = app
+            .names
+            .get(&target)
+            .cloned()
+            .unwrap_or_else(|| "them".into());
+        app.whispering = Some(target);
+        app.status = format!("whispering to {who} — esc goes back to the room");
         return;
     }
-    let text = text.to_string();
+    send_whisper(app, target, text).await;
+}
+
+/// Sends one whisper and leaves the prompt pointed at that person.
+async fn send_whisper(app: &mut App, target: [u8; 32], text: String) {
     let Some(room) = app.room.clone() else { return };
     // A quoted whisper can only travel back to the person it was with. Sent
     // to anyone else it is the same trap as answering one out loud: they
@@ -2509,6 +2544,8 @@ async fn whisper_cmd(app: &mut App, line: &str) {
     // message instead.
     app.replying = None;
     app.picked = None;
+    // Stay pointed at them, so the next line does not need the command again.
+    app.whispering = Some(target);
     app.follow = true;
     app.unread = 0;
     sync_feed(app).await;
@@ -3176,18 +3213,50 @@ fn draw_input(f: &mut Frame, area: Rect, app: &App) {
         app.input.text.replace('\n', "↵")
     };
     let cursor = if app.masked { 0 } else { app.input.cursor };
-    let room = (area.width as usize).saturating_sub(6).max(8);
+    // Whispering changes where every keystroke goes, so it changes the
+    // prompt itself rather than announcing it somewhere off to the side. The
+    // disguise drops it with the draft: a name at the prompt is a real name.
+    let lead = match app.whispering.filter(|_| !app.masked && !hide) {
+        Some(them) => {
+            let who = app
+                .names
+                .get(&them)
+                .cloned()
+                .unwrap_or_else(|| "them".into());
+            format!("  {who} {WHISPER_MARK} ")
+        }
+        None => "  > ".to_string(),
+    };
+    let room = (area.width as usize)
+        .saturating_sub(lead.chars().count() + 2)
+        .max(8);
     let start = cursor.saturating_sub(room);
     let shown: String = full.chars().skip(start).take(room).collect();
-    let p = Paragraph::new(format!("  > {shown}"))
-        .style(Style::default().fg(Color::Rgb(200, 200, 190)))
-        .block(
-            Block::default()
-                .borders(Borders::TOP)
-                .border_style(Style::default().fg(Color::Rgb(50, 55, 50))),
-        );
+    let quiet = app.whispering.is_some() && !app.masked && !hide;
+    let p = Paragraph::new(Line::from(vec![
+        Span::styled(
+            lead.clone(),
+            if quiet {
+                Style::default()
+                    .fg(Color::Rgb(230, 190, 120))
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Rgb(200, 200, 190))
+            },
+        ),
+        Span::styled(shown, Style::default().fg(Color::Rgb(200, 200, 190))),
+    ]))
+    .block(
+        Block::default()
+            .borders(Borders::TOP)
+            .border_style(Style::default().fg(if quiet {
+                Color::Rgb(150, 120, 60)
+            } else {
+                Color::Rgb(50, 55, 50)
+            })),
+    );
     f.render_widget(p, area);
-    let col = 4u16.saturating_add((cursor - start) as u16);
+    let col = (lead.chars().count() as u16).saturating_add((cursor - start) as u16);
     f.set_cursor_position((area.x.saturating_add(col), area.y.saturating_add(1)));
 }
 
@@ -3264,6 +3333,21 @@ mod tests {
                 })
                 .collect::<Vec<_>>()
                 .join("\n")
+        }
+
+        /// The painted buffer, one string per row.
+        fn painted_lines(&mut self) -> Vec<String> {
+            let app = &mut self.app;
+            self.term.draw(|f| draw(f, app)).unwrap();
+            let buf = self.term.backend().buffer();
+            let w = buf.area.width as usize;
+            buf.content
+                .iter()
+                .map(|c| c.symbol().to_string())
+                .collect::<Vec<_>>()
+                .chunks(w)
+                .map(|row| row.join("").trim_end().to_string())
+                .collect()
         }
 
         fn painted(&mut self) -> String {
@@ -4064,12 +4148,17 @@ mod tests {
             h.app.status
         );
 
+        // A name on its own is no longer a mistake: it aims the prompt, which
+        // is what stops the *next* line needing the command again.
         h.app.names.insert([9u8; 32], "Diamante".into());
         h.cmd("/w Diamante").await;
+        assert_eq!(h.app.whispering, Some([9u8; 32]));
         assert!(
-            h.app.status.contains("usage"),
-            "a name alone is not a message"
+            h.app.status.contains("Diamante"),
+            "it has to say who is listening, got {:?}",
+            h.app.status
         );
+        h.app.whispering = None;
 
         // Tab completion fills the name in from who has spoken.
         h.app.input.clear();
@@ -4381,6 +4470,124 @@ mod tests {
             "and it has to say so, got {:?}",
             h.app.status
         );
+    }
+
+    /// The whole point of the sticky mode: the second private sentence does
+    /// not need the command, and therefore cannot be sent to the room by
+    /// forgetting it.
+    #[tokio::test]
+    async fn whispering_stays_pointed_at_the_same_person() {
+        let mut h = Harness::new();
+        h.cmd("/new gpt-oss-20b").await;
+        let dale = peer_who_can_be_whispered_to(&mut h.app, "Dale").await;
+
+        h.cmd("/w Dale ta rolando aquilo?").await;
+        assert_eq!(h.app.whispering, Some(dale), "the prompt should follow");
+
+        // The line that used to go to the whole room.
+        send(&mut h.app, "pois e, o chefe soube".into()).await;
+        match h.app.feed.last() {
+            Some(Feed::Msg {
+                body,
+                whisper: Some(other),
+                ..
+            }) => {
+                assert_eq!(body, "pois e, o chefe soube");
+                assert_eq!(*other, dale, "it must have stayed private");
+            }
+            _ => panic!("the follow-up went to the room, status {:?}", h.app.status),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_prompt_says_who_is_listening_and_esc_lets_go() {
+        let mut h = Harness::new();
+        h.cmd("/new gpt-oss-20b").await;
+        peer_who_can_be_whispered_to(&mut h.app, "Dale").await;
+
+        assert!(!h.painted().contains("Dale >"), "nothing pointed at yet");
+
+        // A bare `/w <name>` just aims the prompt.
+        h.cmd("/w Dale").await;
+        let aimed = h.painted();
+        assert!(
+            aimed.contains(&format!("Dale {WHISPER_MARK}")),
+            "the prompt has to name who is listening:\n{aimed}"
+        );
+
+        // Esc clears a half-typed line first, so one keystroke too many never
+        // drops you into the room mid-sentence.
+        h.app.input.insert_str("meia frase");
+        h.press(KeyCode::Esc).await;
+        assert_eq!(h.app.input.text, "", "the line goes first");
+        assert_eq!(h.app.whispering, h.app.whispering, "still aimed");
+        assert!(h.app.whispering.is_some(), "and only then the whisper");
+
+        h.press(KeyCode::Esc).await;
+        assert_eq!(h.app.whispering, None, "the second esc lets go");
+        assert!(!h.painted().contains(&format!("Dale {WHISPER_MARK}")));
+    }
+
+    /// A real name at the prompt would walk straight through the disguise.
+    #[tokio::test]
+    async fn the_disguise_takes_the_name_off_the_prompt() {
+        let mut h = Harness::new();
+        h.cmd("/new gpt-oss-20b").await;
+        peer_who_can_be_whispered_to(&mut h.app, "Dale").await;
+        h.cmd("/w Dale").await;
+
+        h.app.masked = true;
+        let masked = h.painted();
+        assert!(!masked.contains("Dale"), "the name leaked:\n{masked}");
+        // Still aimed, though -- F12 hides, it does not decide who you talk to.
+        assert!(h.app.whispering.is_some());
+    }
+
+    /// Nobody from the previous room can be whispered to from this one.
+    #[tokio::test]
+    async fn leaving_a_room_lets_go_of_the_whisper() {
+        let mut h = Harness::new();
+        h.cmd("/new gpt-oss-20b").await;
+        peer_who_can_be_whispered_to(&mut h.app, "Dale").await;
+        h.cmd("/w Dale").await;
+        assert!(h.app.whispering.is_some());
+
+        h.cmd("/leave").await;
+        assert_eq!(
+            h.app.whispering, None,
+            "a prompt still pointing at someone from another room would be a lie"
+        );
+    }
+
+    /// Prints the prompt in both states, to eyeball that "who is listening"
+    /// is impossible to miss.
+    ///
+    ///   cargo test preview_the_prompt -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn preview_the_prompt() {
+        let mut h = Harness::new();
+        h.cmd("/new gpt-oss-20b").await;
+        peer_who_can_be_whispered_to(&mut h.app, "Dale").await;
+
+        h.app.input.insert_str("e a daily, o que ficou?");
+        let room = h.painted_lines();
+        println!("
+--- falando com a sala ---");
+        for line in room.iter().rev().take(3).rev() {
+            println!("{line}");
+        }
+
+        h.cmd("/w Dale").await;
+        h.app.input.clear();
+        h.app.input.insert_str("pois e, o chefe soube");
+        let quiet = h.painted_lines();
+        println!("
+--- sussurrando ---");
+        for line in quiet.iter().rev().take(3).rev() {
+            println!("{line}");
+        }
+        println!();
     }
 
     /// The quote lives inside the ciphertext, so the disguise -- which drops
