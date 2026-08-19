@@ -605,6 +605,32 @@ mod tests {
         }
     }
 
+    /// Fetches the real published release and puts it through the same checks
+    /// the app applies before installing anything.
+    ///
+    /// Ignored by default because it needs the network and a published
+    /// release. This is the one that would catch a manifest the app cannot
+    /// parse, or a binary whose signature does not match what was uploaded --
+    /// both of which look fine from a browser.
+    ///
+    ///   cargo test the_published_release_passes_our_own_checks -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn the_published_release_passes_our_own_checks() {
+        let manifest = fetch_manifest().await.expect("manifest should parse");
+        println!("published version: {}", manifest.version);
+        println!("url: {}", manifest.url);
+
+        let bytes = fetch_binary(&manifest)
+            .await
+            .expect("the published binary must pass digest and signature");
+        println!("binary: {} bytes, verified", bytes.len());
+
+        // And it must actually be a Windows executable, not an error page
+        // that happened to hash correctly.
+        assert_eq!(&bytes[..2], b"MZ", "that is not a windows executable");
+    }
+
     #[test]
     fn hex_decoding_refuses_what_is_not_hex() {
         assert_eq!(hex_bytes("00ff").as_deref(), Some([0x00, 0xff].as_slice()));
