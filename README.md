@@ -283,7 +283,9 @@ cargo test
 cargo build --release
 ```
 
-O exe sai em `target\release\local-llm.exe`. Alvo: &lt; 8 MB.
+O exe sai em `target\release\local-llm.exe`. Alvo: &lt; 8 MB — hoje em
+**7,2 MB**, sendo ~0,8 MB do cliente HTTP que o `/update` usa. A folga ficou
+curta; a próxima feature grande provavelmente exige rever o alvo.
 
 ```powershell
 Compress-Archive -Path target\release\local-llm.exe -DestinationPath local-llm-0.5.0-windows-x64.zip -Force

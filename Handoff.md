@@ -121,6 +121,62 @@ Binário: LTO fat, `opt-level = "s"`, strip, panic=abort. Alvo &lt; 8 MB. Teams 
 
 ## Onde paramos (19/ago/2026)
 
+### Auto-update e o atrito do antivirus (0.5.0)
+
+O Pedro pediu duas coisas: que o antivirus parasse de travar cada binario
+novo, e um `/update` que instalasse sozinho. A premissa dele para a primeira
+-- "se o exe fosse mais estatico e o software residisse em pacotes" -- **nao
+se sustenta**, e vale registrar por que, para nao voltar ao assunto:
+
+- Quem escaneia o exe do grupo e o **Bitdefender Endpoint gerenciado pela
+  empresa** (`root\SecurityCenter2`, estado `0x41000`), nao o Defender. O
+  Pedro **nao e admin** e o Defender esta sob policy corporativa, entao nem
+  exclusao da para adicionar.
+- AV de endpoint escaneia o **processo, nao o formato**. Binario monolitico
+  e *mais* suspeito a heuristica, e cada DLL nova seria mais um arquivo sem
+  reputacao para escanear.
+
+**O achado que resolveu metade da dor**, testado neste ambiente e nao
+suposto: arquivo baixado por codigo **nao recebe Mark of the Web**. Um
+`Invoke-WebRequest` nao cria o stream `Zone.Identifier`; so navegador e
+Explorer carimbam. Entao o proprio app baixar o binario elimina o
+SmartScreen. O scan do Bitdefender continua -- para isso so certificado de
+assinatura ou allowlist da TI, ambos fora do nosso alcance.
+
+Como ficou o `/update`:
+
+- **So manual.** Unica coisa que fala com fora da LAN, e apenas quando
+  alguem digita o comando. Sem checagem ao abrir, para nao quebrar a fachada
+  de app local.
+- **Duas verificacoes que pegam coisas diferentes:** sha256 (download
+  truncado/corrompido) e assinatura Ed25519 (download intacto vindo das maos
+  erradas). O TLS do github prova que os bytes chegaram sem alteracao; nao
+  prova que o github servia o *nosso* binario.
+- **Troca do exe em execucao:** o Windows nao deixa sobrescrever, mas deixa
+  renomear. O que roda vira `.old`, o novo assume o nome, e e lancado com
+  `--just-updated` para varrer o `.old`. Se o segundo rename falha, o antigo
+  volta -- a maquina nunca fica sem executavel.
+- **Volta pra sala** gravando so o topico, nunca o PIN. Sala trancada para na
+  tela de chave em vez de ser pulada.
+
+Chave de release: par Ed25519 gerado nesta rodada. Publica embutida em
+`update.rs` (`RELEASE_PUBKEY`), privada entregue ao Pedro em
+`C:\Users\pedro.ailton\local-llm-release.key` -- ele guarda no gerenciador de
+senhas e apaga o arquivo. O `scripts/publish-release.ps1` **recusa publicar**
+se a chave usada nao bater com a embutida, porque errar isso significaria um
+release que ninguem consegue instalar.
+
+Decisoes de dependencia: manifesto em **TOML** e nao JSON, porque `toml` ja
+era dep direta e `serde_json` nao estava na arvore. `reqwest`/`rustls`/`ring`
+ja vinham com o iroh; viraram diretas so para fixar features.
+
+**Custo:** o exe foi de 6,42 para **7,22 MB** (alvo 8). A folga ficou curta.
+
+**Ainda nao verificado por mim:** o ciclo completo com um release publicado de
+verdade -- so o dry-run rodou. E se o Bitdefender reclama do exe se
+substituindo, o que so aparece na primeira atualizacao real.
+
+
 Estado no git: branch `feat/imagens`, versão **0.4.0**. 85 testes, clippy
 limpo, exe em **6,40 MB** (teto 8).
 
