@@ -1543,6 +1543,16 @@ async fn handle_chat<B: Backend>(
             Some(idx) => toggle_expanded(app, idx).await,
             None => app.status = "alt+up picks a picture to open".into(),
         },
+        // Ctrl+Shift+V always means "paste the picture", because Ctrl+V may
+        // never reach us: on Windows the terminal usually swallows it and
+        // injects the clipboard text itself.
+        KeyCode::Char('v' | 'V') if is_shortcut(&key) && shift => paste_image(app).await,
+        // Plain Ctrl+V, for the terminals that do pass it through. Guarded on
+        // there actually being a picture, so a text paste that also arrived
+        // as injected keystrokes is never doubled up.
+        KeyCode::Char('v') if is_shortcut(&key) && crate::sys::has_image() => {
+            paste_image(app).await
+        }
         KeyCode::PageUp => {
             app.follow = false;
             app.scroll = app.scroll.saturating_sub(page);
@@ -1800,8 +1810,10 @@ async fn image_cmd(app: &mut App, line: &str) {
         app.status = "open a room first".into();
         return;
     }
+    // Bare `/img` takes whatever is on the clipboard, which is the short way
+    // round after win+shift+s.
     if arg.is_empty() {
-        app.status = "usage: /img C:\\path\\to\\picture.png".into();
+        paste_image(app).await;
         return;
     }
     // Quotes are what the Explorer's "copy as path" puts around a path.
@@ -1814,6 +1826,21 @@ async fn image_cmd(app: &mut App, line: &str) {
         }
     };
     send_image(app, raw).await;
+}
+
+/// Sends whatever picture is on the clipboard, if there is one.
+async fn paste_image(app: &mut App) {
+    if app.room.is_none() {
+        app.status = "open a room first".into();
+        return;
+    }
+    match crate::sys::grab_image() {
+        Some(grab) => match crate::media::from_clipboard(grab) {
+            Ok(bytes) => send_image(app, bytes).await,
+            Err(e) => app.status = format!("clipboard: {e}"),
+        },
+        None => app.status = "no picture on the clipboard — win+shift+s snips one".into(),
+    }
 }
 
 /// Shrinks a picture to something worth putting on a LAN, files it, and

@@ -108,6 +108,25 @@ pub fn prepare(raw: &[u8]) -> Result<Prepared> {
     })
 }
 
+/// Turns what the clipboard gave us into bytes `prepare` can work with.
+///
+/// A snipped screenshot arrives as loose pixels with no container, so it has
+/// to be encoded before anything else can look at it. PNG, because a snip is
+/// almost always text or UI, which JPEG smears.
+pub fn from_clipboard(grab: crate::sys::Grab) -> Result<Vec<u8>> {
+    match grab {
+        crate::sys::Grab::Encoded(bytes) => Ok(bytes),
+        crate::sys::Grab::Raw { w, h, rgba } => {
+            if u64::from(w) * u64::from(h) > MAX_PIXELS {
+                bail!("clipboard picture is {w}x{h}, too large");
+            }
+            let buf = image::RgbaImage::from_raw(w, h, rgba)
+                .ok_or_else(|| anyhow!("clipboard pixels do not match {w}x{h}"))?;
+            encode(&DynamicImage::ImageRgba8(buf), image::ImageFormat::Png)
+        }
+    }
+}
+
 fn encode(img: &DynamicImage, format: image::ImageFormat) -> Result<Vec<u8>> {
     let mut out = std::io::Cursor::new(Vec::new());
     // JPEG has no alpha; without this a screenshot with a transparent corner
