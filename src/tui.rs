@@ -964,8 +964,34 @@ async fn sync_feed(app: &mut App) {
             // Neither carries a message: one is a key, the other a heartbeat
             // that was never stored to begin with.
             Record::Identity { .. } | Record::Presence { .. } => {}
-            // Only the two ends can open it. For anybody else this simply
-            // produces nothing -- not even a hint that it happened.
+            // A whisper with nobody's name on it. Only the two ends can open
+            // it; for everybody else this produces nothing at all -- not even
+            // a hint that it happened, which is the whole point.
+            Record::Quiet(sealed) => {
+                let Some(opened) = room.open_whisper(rec) else {
+                    continue;
+                };
+                // It has no (author, seq) to be indexed by -- that pair is
+                // precisely what it refuses to publish. The random id stands
+                // in: the leading bytes are unique enough to key on, and every
+                // machine derives the same one, so a reply to it resolves
+                // everywhere it can be read.
+                let seq = u64::from_le_bytes(sealed.id[..8].try_into().unwrap_or([0; 8]));
+                app.by_key.insert((opened.from, seq), app.feed.len());
+                app.feed.push(Feed::Msg {
+                    author: opened.from,
+                    seq,
+                    name: opened.name,
+                    mine: opened.mine,
+                    body: opened.body,
+                    ts: sealed.ts,
+                    reply_to: opened.reply_to,
+                    whisper: Some(opened.them),
+                    image: None,
+                });
+            }
+            // Legacy whisper: same on screen, but its record announced the two
+            // ends to the whole room.
             Record::Whisper {
                 author, seq, ts, ..
             } => {
@@ -2531,7 +2557,7 @@ async fn send_whisper(app: &mut App, target: [u8; 32], text: String) {
     }
     let rec = {
         let mut room = room.lock().await;
-        match room.compose_whisper(target, text.to_string(), reply) {
+        match room.compose_sealed(target, text.to_string(), reply) {
             Ok(rec) => rec,
             Err(e) => {
                 app.status = format!("whisper not sent: {e}");

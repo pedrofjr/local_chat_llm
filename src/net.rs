@@ -21,10 +21,11 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, Mutex};
 
-/// Bumped whenever the sync vocabulary changes -- v3 added the two messages
-/// that move picture blobs. An older build simply fails to connect, which is a
-/// better failure than half-understood traffic.
-pub const SYNC_ALPN: &[u8] = b"local-llm/3";
+/// Bumped whenever the sync vocabulary changes: v3 added the two messages that
+/// move picture blobs, v4 added the sealed-whisper ids to `Have`. An older
+/// build simply fails to connect, which is a better failure than
+/// half-understood traffic.
+pub const SYNC_ALPN: &[u8] = b"local-llm/4";
 
 /// Ceiling on one picture in flight. Its own number on purpose: the record
 /// batch has a 2 MB cap whose errors are swallowed, and sharing that budget is
@@ -81,6 +82,11 @@ fn save_peers(room: &OpenRoom, peers: &[EndpointAddr]) {
 enum SyncMsg {
     Have {
         heads: BTreeMap<[u8; 32], u64>,
+        /// Sealed whispers already held. They carry no author, so the
+        /// per-author high-water marks cannot cover them and the ids have to
+        /// travel. A room of four trading a few hundred whispers is a few
+        /// kilobytes here, well inside the 64 KB the request is read with.
+        sealed: Vec<[u8; 32]>,
     },
     /// Records travel as opaque bytes so one entry this build cannot parse
     /// costs that entry, not the whole batch.
@@ -140,11 +146,11 @@ impl ProtocolHandler for SyncState {
         let req = recv.read_to_end(64 * 1024).await.map_err(io_err)?;
         let msg: SyncMsg = postcard::from_bytes(&req).map_err(io_err)?;
         match msg {
-            SyncMsg::Have { heads } => {
+            SyncMsg::Have { heads, sealed } => {
                 let missing: Vec<Vec<u8>> = {
                     let room = self.room.lock().await;
                     room.log
-                        .missing_for(&heads)
+                        .missing_for(&heads, &sealed)
                         .iter()
                         .filter_map(|rec| rec.encode().ok())
                         .collect()
@@ -439,8 +445,11 @@ async fn sync_loop(
         if peers.is_empty() {
             continue;
         }
-        let heads = { room.lock().await.log.heads() };
-        let req = match postcard::to_stdvec(&SyncMsg::Have { heads }) {
+        let (heads, sealed) = {
+            let room = room.lock().await;
+            (room.log.heads(), room.log.sealed_ids())
+        };
+        let req = match postcard::to_stdvec(&SyncMsg::Have { heads, sealed }) {
             Ok(b) => b,
             Err(_) => continue,
         };
@@ -764,6 +773,114 @@ mod tests {
             .expect("bind");
         wait_for_addrs(&endpoint).await;
         endpoint
+    }
+
+    /// Sealed whispers have no author, so the per-author high-water marks that
+    /// carry every other record cannot carry them. This puts one across a real
+    /// QUIC stream to prove the id-based path works -- and that the peer
+    /// relaying it still cannot read it.
+    #[tokio::test]
+    async fn a_sealed_whisper_syncs_without_naming_anyone() {
+        let pin = Pin::parse("7K2M-9QXP").unwrap();
+        let (ta, tb, tc) = (
+            TempDir::new().unwrap(),
+            TempDir::new().unwrap(),
+            TempDir::new().unwrap(),
+        );
+        let open = |tmp: &TempDir| {
+            let dir = DataDir::from_path(tmp.path().to_path_buf()).unwrap();
+            OpenRoom::join(&dir, pin.clone(), Some("sala")).unwrap()
+        };
+        let (mut ana, mut bia, mut caio) = (open(&ta), open(&tb), open(&tc));
+        let ids: Vec<Record> = [&mut ana, &mut bia, &mut caio]
+            .iter_mut()
+            .map(|r| r.announce_identity().unwrap().unwrap())
+            .collect();
+        for room in [&mut ana, &mut bia, &mut caio] {
+            for id in &ids {
+                let _ = room.ingest(id.clone());
+            }
+        }
+
+        let secret = ana
+            .compose_sealed(bia.author, "o chefe vem quinta".into(), None)
+            .unwrap();
+
+        // Caio holds it and serves it, without ever being able to read it.
+        caio.ingest(secret.clone()).unwrap();
+        assert!(caio.open_whisper(&secret).is_none(), "not his to read");
+
+        let serving = Arc::new(Mutex::new(caio));
+        let endpoint = local_endpoint().await;
+        let router = Router::builder(endpoint.clone())
+            .accept(
+                SYNC_ALPN,
+                SyncState {
+                    room: serving.clone(),
+                },
+            )
+            .spawn();
+        let mut addr = endpoint.addr();
+        addr.addrs.insert(TransportAddr::Ip(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            endpoint.bound_sockets()[0].port(),
+        )));
+
+        // Bia has not seen it yet and asks.
+        assert!(bia.open_whisper(&secret).is_some(), "it is hers to read");
+        let bia = Arc::new(Mutex::new(bia));
+        let (heads, sealed) = {
+            let room = bia.lock().await;
+            (room.log.heads(), room.log.sealed_ids())
+        };
+        assert!(sealed.is_empty(), "she starts without it");
+        let req = postcard::to_stdvec(&SyncMsg::Have { heads, sealed }).unwrap();
+
+        let asking = local_endpoint().await;
+        let conn = asking.connect(addr, SYNC_ALPN).await.unwrap();
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        send.write_all(&req).await.unwrap();
+        send.finish().unwrap();
+        let buf = recv.read_to_end(2 * 1024 * 1024).await.unwrap();
+        let SyncMsg::Give { records } = postcard::from_bytes(&buf).unwrap() else {
+            panic!("expected records");
+        };
+
+        let mut landed = false;
+        {
+            let mut room = bia.lock().await;
+            for raw in records {
+                if let Ok(rec) = Record::decode(&raw) {
+                    let is_sealed = matches!(rec, Record::Quiet(_));
+                    if room.ingest(rec).unwrap_or(false) && is_sealed {
+                        landed = true;
+                    }
+                }
+            }
+        }
+        assert!(landed, "the sealed whisper should have crossed");
+
+        let room = bia.lock().await;
+        let opened = room
+            .log
+            .records()
+            .iter()
+            .find_map(|rec| room.open_whisper(rec))
+            .expect("and opened on arrival");
+        assert_eq!(opened.body, "o chefe vem quinta");
+        assert_eq!(opened.from, ana.author);
+
+        // Asking again with it in hand must not send it a second time.
+        let sealed = room.log.sealed_ids();
+        assert_eq!(sealed.len(), 1);
+        drop(room);
+        let again = serving.lock().await.log.missing_for(&BTreeMap::new(), &sealed);
+        assert!(
+            !again.iter().any(|r| matches!(r, Record::Quiet(_))),
+            "an id already held must not be resent forever"
+        );
+
+        router.shutdown().await.ok();
     }
 
     /// Two real iroh endpoints, one asking the other for the pixels behind a

@@ -47,8 +47,9 @@ pub enum Record {
         reply_to: Option<([u8; 32], u64)>,
         sig: Vec<u8>,
     },
-    /// A message only `to` can read. Everyone else keeps the bytes and can
-    /// still check the signature, but the plaintext is not theirs to have.
+    /// Legacy whisper, written up to 0.4.0. Still read, never written: it put
+    /// `author` and `to` in the clear, so the room could see who talked to
+    /// whom. Superseded by [`Record::Quiet`].
     Whisper {
         author: [u8; 32],
         seq: u64,
@@ -93,6 +94,34 @@ pub enum Record {
         reply_to: Option<([u8; 32], u64)>,
         sig: Vec<u8>,
     },
+    /// A whisper with nobody's name on the outside. See [`Sealed`].
+    Quiet(Sealed),
+}
+
+/// A whisper that does not say who it is between.
+///
+/// The older `Whisper` carried `author` and `to` in the clear, so anybody
+/// holding the room key -- which is everybody here -- could read off who
+/// talked to whom and when, straight out of `log.bin`. Only the words were
+/// protected. Here nothing on the outside names a person: the sender, their
+/// name, the text and their signature all live inside `ct`, and the recipient
+/// finds their own mail by trying to open each one.
+///
+/// What still leaks: that a whisper happened, when, and roughly how long it
+/// was. In a room of four, "one of us said something to one of us" is most of
+/// what is left to hide, and hiding it would need cover traffic.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Sealed {
+    /// Random. Names the record for dedup without tying it to anyone -- the
+    /// old scheme used (author, seq), which is exactly what we are hiding.
+    pub id: [u8; 32],
+    pub ts: u64,
+    /// Sealed with the pair key. Holds the sender, their name, the body, the
+    /// reply, and their signature over all of it.
+    pub ct: Vec<u8>,
+    /// Keyed with the room key: says a member wrote this, without saying
+    /// which. Lets a bystander reject noise they cannot read.
+    pub tag: [u8; 32],
 }
 
 /// What the bytes decode as. Kept narrow on purpose: every extra format is
@@ -147,7 +176,13 @@ impl Record {
             | Record::Post { author, seq, .. }
             | Record::Whisper { author, seq, .. }
             | Record::Image { author, seq, .. } => Some((*author, *seq)),
-            Record::Meta { .. } | Record::Identity { .. } | Record::Presence { .. } => None,
+            // A sealed whisper deliberately has no (author, seq) to give:
+            // that pair is exactly the metadata being hidden. It is
+            // deduplicated by its own random id instead.
+            Record::Meta { .. }
+            | Record::Identity { .. }
+            | Record::Presence { .. }
+            | Record::Quiet(_) => None,
         }
     }
 
@@ -163,7 +198,8 @@ impl Record {
             Record::Meta { .. }
             | Record::Identity { .. }
             | Record::Whisper { .. }
-            | Record::Presence { .. } => None,
+            | Record::Presence { .. }
+            | Record::Quiet(_) => None,
         }
     }
 
@@ -176,7 +212,7 @@ impl Record {
             | Record::Identity { author, .. }
             | Record::Presence { author, .. }
             | Record::Image { author, .. } => Some(author),
-            Record::Meta { .. } => None,
+            Record::Meta { .. } | Record::Quiet(_) => None,
         }
     }
 
@@ -446,6 +482,9 @@ pub struct RoomLog {
     key: RoomKey,
     records: Vec<Record>,
     seen: BTreeMap<([u8; 32], u64), ()>,
+    /// Ids of sealed whispers already held. Their own index, because they
+    /// carry no author to key on.
+    sealed: BTreeMap<[u8; 32], ()>,
 }
 
 impl RoomLog {
@@ -463,6 +502,7 @@ impl RoomLog {
                 key,
                 records: Vec::new(),
                 seen: BTreeMap::new(),
+                sealed: BTreeMap::new(),
             };
             if let Some(alias) = alias {
                 log.append(Record::Meta {
@@ -488,6 +528,7 @@ impl RoomLog {
             key,
             records: Vec::new(),
             seen: BTreeMap::new(),
+            sealed: BTreeMap::new(),
         };
         let mut duplicates = 0usize;
         let mut unreadable = 0usize;
@@ -541,6 +582,9 @@ impl RoomLog {
                 // A heartbeat is true for a few seconds and then it is not.
                 // Keeping it would be both useless and unbounded.
                 Record::Presence { .. } => false,
+                // Its random id stands in for the (author, seq) the others
+                // use, since naming the author is the thing being avoided.
+                Record::Quiet(sealed) => !self.sealed.contains_key(&sealed.id),
                 _ => true,
             },
         }
@@ -549,6 +593,9 @@ impl RoomLog {
     fn remember(&mut self, rec: Record) {
         if let Some(key) = rec.chat_key() {
             self.seen.insert(key, ());
+        }
+        if let Record::Quiet(sealed) = &rec {
+            self.sealed.insert(sealed.id, ());
         }
         self.records.push(rec);
     }
@@ -566,6 +613,13 @@ impl RoomLog {
         fs::write(&staging, &bytes)?;
         fs::rename(&staging, &self.path)?;
         Ok(())
+    }
+
+    /// Room-keyed tag for a sealed whisper, using the key this log already
+    /// holds. Deriving it fresh each time would mean running Argon2id -- 32 MB
+    /// and three passes -- on every whisper sent and every whisper received.
+    pub fn tag(&self, parts: &[&[u8]]) -> [u8; 32] {
+        self.key.tag(parts)
     }
 
     pub fn records(&self) -> &[Record] {
@@ -726,15 +780,33 @@ impl RoomLog {
         heads
     }
 
-    pub fn missing_for(&self, their: &BTreeMap<[u8; 32], u64>) -> Vec<Record> {
+    /// What a peer is missing.
+    ///
+    /// Ordinary records are settled by the per-author high-water marks in
+    /// `their`. Sealed whispers cannot be: they publish no author, which is
+    /// the point, so the peer has to name the ids it already holds and we send
+    /// the rest.
+    pub fn missing_for(
+        &self,
+        their: &BTreeMap<[u8; 32], u64>,
+        their_sealed: &[[u8; 32]],
+    ) -> Vec<Record> {
         self.records
             .iter()
-            .filter(|rec| match rec.chat_key() {
-                None => matches!(rec, Record::Meta { .. } | Record::Identity { .. }),
-                Some((author, seq)) => their.get(&author).is_none_or(|h| seq > *h),
+            .filter(|rec| match rec {
+                Record::Quiet(sealed) => !their_sealed.contains(&sealed.id),
+                _ => match rec.chat_key() {
+                    None => matches!(rec, Record::Meta { .. } | Record::Identity { .. }),
+                    Some((author, seq)) => their.get(&author).is_none_or(|h| seq > *h),
+                },
             })
             .cloned()
             .collect()
+    }
+
+    /// Ids of every sealed whisper held here, for the peer to diff against.
+    pub fn sealed_ids(&self) -> Vec<[u8; 32]> {
+        self.sealed.keys().copied().collect()
     }
 
     pub fn append(&mut self, rec: Record) -> Result<bool> {
@@ -923,6 +995,15 @@ mod tests {
                 sig: blank(),
             }),
             7
+        );
+        assert_eq!(
+            tag(Record::Quiet(Sealed {
+                id: [0; 32],
+                ts: 0,
+                ct: blank(),
+                tag: [0; 32],
+            })),
+            8
         );
     }
 

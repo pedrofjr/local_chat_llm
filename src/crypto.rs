@@ -167,6 +167,30 @@ pub fn whisper_key(
     RoomKey(blake3::derive_key("local-llm whisper v1", &material))
 }
 
+impl RoomKey {
+    /// Keyed hash proving the writer held the room key.
+    ///
+    /// This is what lets someone who is *not* the recipient decide whether a
+    /// sealed record belongs in the log at all. Without it, hiding the sender
+    /// would mean nobody could tell a real record from noise, and anyone on
+    /// the network could pad everybody's history with garbage. It says
+    /// "somebody in this room wrote this" and nothing more -- which is the
+    /// whole point.
+    ///
+    /// It cannot say *who*: everyone here holds the same key, so any of the
+    /// four could produce it. Authorship is settled by the signature inside
+    /// the ciphertext, which only the recipient can check.
+    pub fn tag(&self, parts: &[&[u8]]) -> [u8; 32] {
+        let key = blake3::derive_key("local-llm sealed tag v1", &self.0);
+        let mut hasher = blake3::Hasher::new_keyed(&key);
+        for part in parts {
+            hasher.update(&(part.len() as u64).to_le_bytes());
+            hasher.update(part);
+        }
+        *hasher.finalize().as_bytes()
+    }
+}
+
 pub fn role_for(author: &[u8; 32]) -> &'static str {
     const ROLES: &[&str] = &[
         "assistant",

@@ -13,7 +13,7 @@ local-llm
 A interface é toda em inglês, para combinar com a fachada de client de modelo.
 
 ```
-  local-llm  0.4.0
+  local-llm  0.5.0
 
   sessions
   >  gpt-oss-20b              ready
@@ -31,7 +31,8 @@ com um Enter. `locked` pede a chave.
 | `/new gpt-oss-20b` | cria a sala, mostra a chave **no corpo do chat** e copia pro clipboard |
 | `/join 7K2M-9QXP` | entra; puxa o histórico dos peers online |
 | `/join 7K2M-9QXP <ticket>` | igual, mas disca um peer na unha (mDNS falhou) |
-| `/w Diamante <texto>` | sussurro: só ele lê. Nome com espaço funciona; `Tab` completa |
+| `/w Diamante` | aponta o prompt para ele; as próximas linhas vão só pra ele até `Esc` |
+| `/w Diamante <texto>` | manda e continua apontado. Nome com espaço funciona; `Tab` completa |
 | `/nick Diamante` | muda o nome; mensagens antigas ficam com o nome de quando foram enviadas |
 | `/notify` | `all`, `mention`, `off`, ou `30m` para calar por um tempo |
 | `/img` | manda a imagem que está na área de transferência |
@@ -90,11 +91,31 @@ respondem ou copiam. A resposta aparece citada:
 Cada pessoa recebe uma **cor própria**, derivada do identificador dela — todo
 mundo vê a mesma pessoa na mesma cor, sem ninguém configurar nada.
 
-`/w <nome> <texto>` manda um sussurro. Ele é cifrado com uma chave que só
-existe entre vocês dois (X25519 derivada do `device.key`), então os outros
-guardam bytes ilegíveis mesmo tendo a chave da sala. O que **vaza** é o
-metadado: quem leu o log vê que houve um sussurro, de quem para quem e quando.
-Só o conteúdo é protegido.
+`/w <nome>` aponta o prompt para alguém, e ele **fica apontado**: o `> ` vira
+`Fulano →` em âmbar, com a borda mudando de cor junto. As próximas linhas vão
+para ele até você apertar `Esc`. Isso não é conforto — é o conserto do acidente
+mais provável do app. Antes, sussurro era um comando por mensagem, e bastava
+esquecer o `/w` em uma linha no meio de uma conversa privada para ela ir à sala
+inteira, sem aviso nenhum.
+
+`Esc` solta, mas em último lugar: primeiro a citação, depois a linha digitada, e
+só então o sussurro. Uma tecla a mais nunca joga meia frase privada na sala. E
+no `F12` o nome sai do prompt junto com o rascunho — nome real atravessando o
+disfarce é exatamente o que o F12 existe para evitar.
+
+O conteúdo é cifrado com uma chave que só existe entre vocês dois (X25519
+derivada do `device.key`). E o registro que fica no disco de todo mundo **não
+diz quem falou com quem**: remetente, nome, texto e assinatura vão todos para
+dentro do envelope, e quem recebe descobre que a mensagem é sua tentando abrir
+cada uma. De fora sobra um identificador aleatório, um horário e bytes ilegíveis.
+
+O sussurro também não consome mais número de sequência junto com as mensagens
+públicas. Isso era um vazamento por si só: um buraco entre duas mensagens
+visíveis da mesma pessoa anunciava que algo privado tinha acontecido.
+
+O que **ainda vaza**: que houve um sussurro, quando, e o tamanho aproximado.
+Esconder isso exigiria tráfego de cobertura — mensagens falsas o tempo todo — e
+numa sala de quatro pessoas o ganho seria pequeno.
 
 Sussurro também responde: marque a mensagem com `Ctrl+R` (ou o `↩ reply`) e
 mande o `/w` normalmente. A citação viaja **dentro** do texto cifrado, então
@@ -264,7 +285,7 @@ cargo build --release
 O exe sai em `target\release\local-llm.exe`. Alvo: &lt; 8 MB.
 
 ```powershell
-Compress-Archive -Path target\release\local-llm.exe -DestinationPath local-llm-0.4.0-windows-x64.zip -Force
+Compress-Archive -Path target\release\local-llm.exe -DestinationPath local-llm-0.5.0-windows-x64.zip -Force
 ```
 
 ## Como compartilhar
@@ -293,7 +314,7 @@ Variáveis de ambiente:
 - Transporte: [Iroh](https://www.iroh.computer) 1.0, só mDNS, sem relay.
 - Ao vivo: `iroh-gossip`. O tópico é `blake3("local-llm/v1" \|\| pin)`.
 - Histórico: log append-only no disco, ChaCha20-Poly1305, chave Argon2id do PIN.
-- Sync: ALPN `local-llm/3` — qualquer peer online serve o que o outro não tem.
+- Sync: ALPN `local-llm/4` — qualquer peer online serve o que o outro não tem.
   Os registros viajam como bytes opacos, então um registro que este build não
   entende custa aquele registro, não o lote inteiro.
 - Imagem: o log carrega só a descrição; os pixels ficam num blob cifrado com a
@@ -324,8 +345,13 @@ Fechar o terminal **não** apaga o histórico. `/forget` apaga. Sem o PIN o arqu
 - Sussurro não tem forward secrecy: as duas pontas derivam sempre a mesma
   chave, que é justamente o que deixa você reler o que mandou. Quem roubar um
   `device.key` depois consegue abrir sussurros antigos daquela pessoa.
-- **Todos precisam atualizar juntos.** O ALPN foi para `local-llm/3` na 0.4.0,
-  quando as imagens entraram; versões diferentes não se conectam.
+- O sussurro esconde **com quem** você falou, não **que** você falou. Quem abrir
+  o `log.bin` vê que houve um sussurro e quando, só não de quem para quem.
+  Sumir com isso exigiria mandar mensagens falsas o tempo todo.
+- Sussurros escritos até a 0.4.0 continuam legíveis, mas aqueles registros
+  **já publicaram** quem falou com quem — o que está no disco não muda.
+- **Todos precisam atualizar juntos.** O ALPN foi para `local-llm/4` na 0.5.0;
+  versões diferentes não se conectam.
 - Endereço guardado envelhece (DHCP troca IP). A tentativa falha rápido e o
   identificador continua servindo pro mDNS resolver; `/ticket` segue como
   último recurso.

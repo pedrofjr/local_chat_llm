@@ -1,5 +1,5 @@
 use crate::crypto::{role_for, whisper_key, whisper_public, whisper_secret, Pin, RoomKey};
-use crate::store::{now_ts, DataDir, ImageKind, Record, RoomLog};
+use crate::store::{now_ts, DataDir, ImageKind, Record, RoomLog, Sealed};
 use anyhow::{anyhow, Result};
 use iroh::{PublicKey, SecretKey};
 use serde::{Deserialize, Serialize};
@@ -26,6 +26,21 @@ struct WhisperBodyV1 {
     body: String,
 }
 
+/// What travels inside a sealed whisper. Everything that names a person is
+/// in here, which is the entire point: on the outside the record is a random
+/// id, a timestamp and ciphertext.
+#[derive(Serialize, Deserialize)]
+struct SealedBody {
+    /// Who wrote it. Only the recipient ever learns this.
+    from: [u8; 32],
+    name: String,
+    body: String,
+    reply_to: Option<([u8; 32], u64)>,
+    /// Ed25519 by `from`, so the recipient knows the sender is who the body
+    /// claims. Checked after opening -- a bystander cannot, and must not.
+    sig: Vec<u8>,
+}
+
 /// An opened whisper.
 pub struct OpenedWhisper {
     pub name: String,
@@ -33,6 +48,10 @@ pub struct OpenedWhisper {
     /// The other end of the conversation, whoever we are.
     pub them: [u8; 32],
     pub reply_to: Option<([u8; 32], u64)>,
+    /// Who wrote it. For a sealed whisper this is only knowable after
+    /// opening, so it is reported here rather than read off the record.
+    pub from: [u8; 32],
+    pub mine: bool,
 }
 
 pub struct OpenRoom {
@@ -148,6 +167,106 @@ impl OpenRoom {
         Ok(rec)
     }
 
+    /// Writes a whisper that names nobody on the outside.
+    ///
+    /// Unlike `compose`, this does **not** take a sequence number. Sharing the
+    /// author's counter with public messages was itself a leak: a gap between
+    /// two visible messages from the same person announced that a whisper had
+    /// happened. A random id costs nothing and closes that.
+    pub fn compose_sealed(
+        &mut self,
+        to: [u8; 32],
+        body: String,
+        reply_to: Option<([u8; 32], u64)>,
+    ) -> Result<Record> {
+        let pair = self.pair_key(&to)?;
+        let mut id = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut id);
+        let ts = now_ts();
+        let name = self.nick.clone();
+        let sig = self.secret.sign(&sealed_payload(
+            &id, ts, &self.author, &to, &name, &body, reply_to,
+        ));
+        let ct = pair.seal(&postcard::to_stdvec(&SealedBody {
+            from: self.author,
+            name,
+            body,
+            reply_to,
+            sig: sig.to_bytes().to_vec(),
+        })?)?;
+        let tag = self.log.tag(&[&id, &ts.to_le_bytes(), &ct]);
+        let rec = Record::Quiet(Sealed { id, ts, ct, tag });
+        self.log.append(rec.clone())?;
+        Ok(rec)
+    }
+
+    /// Opens a sealed whisper if it happens to be ours.
+    ///
+    /// Nothing on the record says who it is for, so the only way to find out
+    /// is to try: for each person whose key we hold, derive the pair key and
+    /// see if it opens. With four people that is three AEAD attempts that fail
+    /// in microseconds. This is the cost of not publishing who talks to whom.
+    fn open_sealed(&self, sealed: &Sealed) -> Option<OpenedWhisper> {
+        let mut candidates: Vec<[u8; 32]> = self
+            .log
+            .records()
+            .iter()
+            .filter_map(|rec| match rec {
+                Record::Identity { author, .. } => Some(*author),
+                _ => None,
+            })
+            .collect();
+        candidates.dedup();
+        for them in candidates {
+            if them == self.author {
+                continue;
+            }
+            let Ok(pair) = self.pair_key(&them) else {
+                continue;
+            };
+            let Ok(plain) = pair.open(&sealed.ct) else {
+                continue;
+            };
+            let Ok(body) = postcard::from_bytes::<SealedBody>(&plain) else {
+                continue;
+            };
+            // The pair key only proves it is between us and `them`; the
+            // signature settles which of the two wrote it. Without this check
+            // either end could put the other's id in `from`.
+            let mine = body.from == self.author;
+            if !mine && body.from != them {
+                continue;
+            }
+            let to = if mine { them } else { self.author };
+            if verify_sig(
+                &body.from,
+                &body.sig,
+                &sealed_payload(
+                    &sealed.id,
+                    sealed.ts,
+                    &body.from,
+                    &to,
+                    &body.name,
+                    &body.body,
+                    body.reply_to,
+                ),
+            )
+            .is_err()
+            {
+                continue;
+            }
+            return Some(OpenedWhisper {
+                name: body.name,
+                body: body.body,
+                them,
+                reply_to: body.reply_to,
+                from: body.from,
+                mine,
+            });
+        }
+        None
+    }
+
     pub fn ingest(&mut self, rec: Record) -> Result<bool> {
         match &rec {
             Record::Chat {
@@ -225,6 +344,18 @@ impl OpenRoom {
                     author, *seq, *ts, name, blob, *w, *h, *kind, *bytes, caption, *reply_to,
                 ),
             )?,
+            // All we can check without being the recipient: that a member of
+            // this room wrote it. That is enough to keep noise out of the log,
+            // and it is deliberately all -- anything stronger would name the
+            // sender to everyone.
+            Record::Quiet(sealed) => {
+                let want = self
+                    .log
+                    .tag(&[&sealed.id, &sealed.ts.to_le_bytes(), &sealed.ct]);
+                if want != sealed.tag {
+                    return Err(anyhow!("sealed record is not from this room"));
+                }
+            }
             Record::Meta { .. } => {}
         }
         self.log.append(rec)
@@ -268,6 +399,12 @@ impl OpenRoom {
         Ok(whisper_key(&secret, &their_pub, &self.author, them))
     }
 
+    /// Writes the pre-0.5 whisper, the one that put both ends in the clear.
+    ///
+    /// Kept only so the tests can produce that shape and prove we still read
+    /// it. Nothing in the app calls this any more -- whispers are written by
+    /// [`OpenRoom::compose_sealed`].
+    #[cfg(test)]
     pub fn compose_whisper(
         &mut self,
         to: [u8; 32],
@@ -300,6 +437,9 @@ impl OpenRoom {
     /// and the person on the other end. Anything else answers None, which is
     /// exactly what a bystander gets.
     pub fn open_whisper(&self, rec: &Record) -> Option<OpenedWhisper> {
+        if let Record::Quiet(sealed) = rec {
+            return self.open_sealed(sealed);
+        }
         let Record::Whisper {
             author, to, ct, ..
         } = rec
@@ -324,6 +464,8 @@ impl OpenRoom {
                 body: opened.body,
                 them,
                 reply_to: opened.reply_to,
+                from: *author,
+                mine,
             });
         }
         let old: WhisperBodyV1 = postcard::from_bytes(&plain).ok()?;
@@ -332,6 +474,8 @@ impl OpenRoom {
             body: old.body,
             them,
             reply_to: None,
+            from: *author,
+            mine,
         })
     }
 
@@ -363,7 +507,9 @@ impl OpenRoom {
                 }
             }
             Record::Presence { name, .. } => name.clone(),
-            Record::Meta { .. } | Record::Identity { .. } => "system".into(),
+            // A sealed whisper only has a name once opened, and whoever can
+            // open it takes the name from inside.
+            Record::Meta { .. } | Record::Identity { .. } | Record::Quiet(_) => "system".into(),
         }
     }
 
@@ -441,6 +587,37 @@ pub fn whisper_payload(author: &[u8; 32], seq: u64, ts: u64, to: &[u8; 32], ct: 
     signed_bytes(
         "local-llm/whisper/v1",
         &[author, &seq.to_le_bytes(), &ts.to_le_bytes(), to, ct],
+    )
+}
+
+/// What the sender signs inside a sealed whisper. The id and timestamp are
+/// covered too, so the visible parts of the record cannot be swapped around
+/// under a signature that still checks out.
+pub fn sealed_payload(
+    id: &[u8; 32],
+    ts: u64,
+    from: &[u8; 32],
+    to: &[u8; 32],
+    name: &str,
+    body: &str,
+    reply_to: Option<([u8; 32], u64)>,
+) -> Vec<u8> {
+    let mut answered = Vec::new();
+    if let Some((target, target_seq)) = reply_to {
+        answered.extend_from_slice(&target);
+        answered.extend_from_slice(&target_seq.to_le_bytes());
+    }
+    signed_bytes(
+        "local-llm/sealed/v1",
+        &[
+            id,
+            &ts.to_le_bytes(),
+            from,
+            to,
+            name.as_bytes(),
+            body.as_bytes(),
+            &answered,
+        ],
     )
 }
 
@@ -617,6 +794,130 @@ mod tests {
         // And the sender can reread what they sent.
         let mine = a.open_whisper(&sealed).expect("sender rereads it");
         assert_eq!(mine.body, "o chefe vem quinta");
+    }
+
+    #[test]
+    fn a_sealed_whisper_names_nobody_on_the_outside() {
+        let pin = Pin::parse("7K2M-9QXP").unwrap();
+        let (ta, tb, tc) = (
+            TempDir::new().unwrap(),
+            TempDir::new().unwrap(),
+            TempDir::new().unwrap(),
+        );
+        let (mut a, mut b, mut c) = (open_at(&ta, &pin), open_at(&tb, &pin), open_at(&tc, &pin));
+        let ia = a.announce_identity().unwrap().unwrap();
+        let ib = b.announce_identity().unwrap().unwrap();
+        let ic = c.announce_identity().unwrap().unwrap();
+        for peer in [&mut a, &mut b, &mut c] {
+            for id in [&ia, &ib, &ic] {
+                let _ = peer.ingest(id.clone());
+            }
+        }
+
+        let rec = a
+            .compose_sealed(b.author, "o chefe vem quinta".into(), None)
+            .unwrap();
+
+        // This is the whole reason the record changed shape: the bytes that
+        // land in everyone's log must not name either end.
+        let Record::Quiet(sealed) = &rec else {
+            panic!("expected a sealed whisper");
+        };
+        let raw = rec.encode().unwrap();
+        for (who, id) in [("sender", a.author), ("recipient", b.author)] {
+            assert!(
+                !raw.windows(32).any(|w| w == id),
+                "the {who}'s id is readable on the wire"
+            );
+        }
+        assert!(
+            !format!("{sealed:?}").contains("chefe"),
+            "the text must not survive in the clear either"
+        );
+
+        // Both ends read it; the third person gets nothing at all.
+        let mine = a.open_whisper(&rec).expect("sender rereads it");
+        assert_eq!(mine.body, "o chefe vem quinta");
+        assert!(mine.mine, "we wrote it");
+        assert_eq!(mine.them, b.author);
+
+        b.ingest(rec.clone()).unwrap();
+        let theirs = b.open_whisper(&rec).expect("recipient reads it");
+        assert_eq!(theirs.body, "o chefe vem quinta");
+        assert!(!theirs.mine);
+        assert_eq!(theirs.from, a.author, "and knows who wrote it");
+
+        c.ingest(rec.clone()).unwrap();
+        assert!(
+            c.open_whisper(&rec).is_none(),
+            "the room key must not open it"
+        );
+    }
+
+    #[test]
+    fn a_sealed_whisper_leaves_no_gap_in_the_senders_numbering() {
+        let pin = Pin::parse("7K2M-9QXP").unwrap();
+        let (ta, tb) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let (mut a, mut b) = (open_at(&ta, &pin), open_at(&tb, &pin));
+        let ia = a.announce_identity().unwrap().unwrap();
+        let ib = b.announce_identity().unwrap().unwrap();
+        b.ingest(ia).unwrap();
+        a.ingest(ib).unwrap();
+
+        let first = a.compose("mensagem publica".into(), None).unwrap();
+        a.compose_sealed(b.author, "e um segredo".into(), None)
+            .unwrap();
+        let second = a.compose("outra publica".into(), None).unwrap();
+
+        // The old whisper took a number from the same counter, so a hole
+        // between two visible messages announced that something private had
+        // happened. Consecutive numbers say nothing.
+        let (_, one) = first.chat_key().unwrap();
+        let (_, two) = second.chat_key().unwrap();
+        assert_eq!(
+            two,
+            one + 1,
+            "a gap in the public numbering is itself a signal"
+        );
+    }
+
+    #[test]
+    fn noise_that_did_not_come_from_the_room_is_refused() {
+        let pin = Pin::parse("7K2M-9QXP").unwrap();
+        let (ta, tb) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let (mut a, mut b) = (open_at(&ta, &pin), open_at(&tb, &pin));
+        let ia = a.announce_identity().unwrap().unwrap();
+        let ib = b.announce_identity().unwrap().unwrap();
+        b.ingest(ia).unwrap();
+        a.ingest(ib).unwrap();
+
+        let rec = a.compose_sealed(b.author, "legitimo".into(), None).unwrap();
+        assert!(b.ingest(rec.clone()).unwrap(), "the real thing is kept");
+
+        // Hiding the sender means nobody can check a signature from outside.
+        // The room-keyed tag is what stops that from becoming "anyone may
+        // append anything to everyone's history".
+        let Record::Quiet(sealed) = &rec else {
+            panic!("expected a sealed whisper");
+        };
+        let forged = Record::Quiet(Sealed {
+            id: [1; 32],
+            ts: sealed.ts,
+            ct: sealed.ct.clone(),
+            tag: [0xab; 32],
+        });
+        assert!(
+            b.ingest(forged).is_err(),
+            "a record without the room tag must not enter the log"
+        );
+
+        // Editing a tagged record breaks the tag too.
+        let mut tampered = sealed.clone();
+        tampered.ts += 1;
+        assert!(
+            b.ingest(Record::Quiet(tampered)).is_err(),
+            "the tag has to cover the visible fields"
+        );
     }
 
     #[test]
