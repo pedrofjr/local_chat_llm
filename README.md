@@ -13,7 +13,7 @@ local-llm
 A interface é toda em inglês, para combinar com a fachada de client de modelo.
 
 ```
-  local-llm  0.3.4
+  local-llm  0.4.0
 
   sessions
   >  gpt-oss-20b              ready
@@ -34,6 +34,9 @@ com um Enter. `locked` pede a chave.
 | `/w Diamante <texto>` | sussurro: só ele lê. Nome com espaço funciona; `Tab` completa |
 | `/nick Diamante` | muda o nome; mensagens antigas ficam com o nome de quando foram enviadas |
 | `/notify` | `all`, `mention`, `off`, ou `30m` para calar por um tempo |
+| `/img` | manda a imagem que está na área de transferência |
+| `/img C:\...\erro.png` | manda um arquivo do disco |
+| `/img proto sixel\|halfblocks\|auto` | como desenhar imagens, se o palpite errar |
 | `/pin` | mostra a chave de novo e copia |
 | `/ticket` | endereço Iroh desta máquina, copiado pro clipboard |
 | `/peers` | **quem** está online agora, por nome |
@@ -53,6 +56,8 @@ Teclas:
 | `Ctrl+R` | responde a escolhida (ou clique no `↩ reply` que aparece no hover) |
 | `Ctrl+Y` | copia a escolhida (ou clique no `⧉ copy`) |
 | `Ctrl+H` | borra a escolhida **só na sua tela** (ou clique no `▨ hide`) |
+| `Ctrl+G` | abre/fecha a imagem da escolhida (ou clique na linha `image (+)`) |
+| `Ctrl+Shift+V` | manda a imagem da área de transferência |
 | `Tab` | completa o nome no `/w` |
 | `F12` | disfarce: nomes viram papéis de modelo, avisos e o rascunho somem |
 | `PgUp` / `PgDn` | rola o histórico — a roda do mouse também rola |
@@ -93,6 +98,44 @@ Só o conteúdo é protegido.
 
 No `F12` os sussurros **somem da tela** por inteiro, e as citações também —
 elas carregariam um nome real através do disfarce.
+
+## Imagens
+
+`Win+Shift+S` recorta a tela, `Ctrl+V` manda. Também funciona arrastar o
+arquivo pro Explorer, copiar e colar, ou `/img C:\caminho\erro.png`.
+
+A imagem **chega fechada**, como uma linha de texto:
+
+```
+  Dale  14:20
+  image (+)  1280x720  184 KB  png
+```
+
+`Ctrl+G` — ou um clique na linha — abre. `Ctrl+G` de novo fecha. Isso não é
+economia de espaço: é o que mantém o disfarce. A tela em repouso continua
+sendo texto, e no `F12` **toda** imagem fecha, inclusive as que você tinha
+aberto, e a linha passa a ler como entrada multimodal (`image input`).
+
+GIF anima. Os quadros são preparados uma vez, na hora de abrir; depois disso
+animar é barato. E a animação **para** quando você fecha, quando ela rola pra
+fora da tela, ou quando o `F12` entra — um app que continua trabalhando
+enquanto finge estar parado é exatamente o tipo de detalhe que entrega.
+
+Quem estiver no **Windows Terminal 1.22 ou mais novo** vê a imagem de verdade
+(sixel). Quem não estiver vê a mesma imagem em meio-bloco, com menos
+resolução — não vê um erro. O app decide isso sozinho, uma vez, na primeira
+execução; `/img proto sixel` ou `/img proto halfblocks` corrige se o palpite
+sair errado.
+
+Limites: **2 MB** por imagem e 1920px no maior lado. Acima disso a imagem é
+reduzida e recomprimida sozinha. GIF acima do limite é **recusado** em vez de
+convertido, porque encolher mataria a animação, que era o ponto.
+
+Os pixels não viajam junto com a mensagem. O que vai pelo gossip é só a
+descrição — hash, tamanho, formato — e os bytes vêm depois, por uma conexão
+própria, guardados cifrados com a chave da sala em `blobs/`. Cada sala gasta
+no máximo **200 MB** com imagens; passando disso, as mais antigas saem e a
+linha passa a dizer `image (unavailable)`.
 
 ## Esconder uma mensagem
 
@@ -185,7 +228,7 @@ cargo build --release
 O exe sai em `target\release\local-llm.exe`. Alvo: &lt; 8 MB.
 
 ```powershell
-Compress-Archive -Path target\release\local-llm.exe -DestinationPath local-llm-0.3.4-windows-x64.zip -Force
+Compress-Archive -Path target\release\local-llm.exe -DestinationPath local-llm-0.4.0-windows-x64.zip -Force
 ```
 
 ## Como compartilhar
@@ -214,9 +257,13 @@ Variáveis de ambiente:
 - Transporte: [Iroh](https://www.iroh.computer) 1.0, só mDNS, sem relay.
 - Ao vivo: `iroh-gossip`. O tópico é `blake3("local-llm/v1" \|\| pin)`.
 - Histórico: log append-only no disco, ChaCha20-Poly1305, chave Argon2id do PIN.
-- Sync: ALPN `local-llm/2` — qualquer peer online serve o que o outro não tem.
+- Sync: ALPN `local-llm/3` — qualquer peer online serve o que o outro não tem.
   Os registros viajam como bytes opacos, então um registro que este build não
   entende custa aquele registro, não o lote inteiro.
+- Imagem: o log carrega só a descrição; os pixels ficam num blob cifrado com a
+  mesma chave e viajam numa conexão à parte. O que a mensagem assina é o
+  **hash** do blob, e um blob cujo conteúdo pare de bater com o nome não abre
+  — junto, isso autentica a imagem sem que ela passe pelo log.
 - Identidade: Ed25519 persistente em `device.key`. Assina cada mensagem. Dela
   também sai, por derivação, a chave X25519 usada nos sussurros — publicada num
   registro assinado, para ninguém plantar chave em nome alheio.
@@ -241,8 +288,8 @@ Fechar o terminal **não** apaga o histórico. `/forget` apaga. Sem o PIN o arqu
 - Sussurro não tem forward secrecy: as duas pontas derivam sempre a mesma
   chave, que é justamente o que deixa você reler o que mandou. Quem roubar um
   `device.key` depois consegue abrir sussurros antigos daquela pessoa.
-- **Todos precisam atualizar juntos.** O formato de registro mudou na 0.2.0 e o
-  ALPN foi para `local-llm/2`; versões diferentes não sincronizam.
+- **Todos precisam atualizar juntos.** O ALPN foi para `local-llm/3` na 0.4.0,
+  quando as imagens entraram; versões diferentes não se conectam.
 - Endereço guardado envelhece (DHCP troca IP). A tentativa falha rápido e o
   identificador continua servindo pro mDNS resolver; `/ticket` segue como
   último recurso.
@@ -250,3 +297,9 @@ Fechar o terminal **não** apaga o histórico. `/forget` apaga. Sem o PIN o arqu
   quem tiver a chave da sala lê normalmente.
 - Presença é o que cada um **diz** de si, assinado. Não é prova de que a pessoa
   está na frente da máquina, e some sozinha depois de 20 s sem sinal.
+- Imagem fechada é discrição, não segurança: os bytes estão na máquina de todo
+  mundo que estava na sala. Fechar tira da tela, não do disco alheio.
+- Tráfego de imagem tem outra cara na rede que tráfego de texto. O app deixa de
+  ser miúdo e invisível quando vocês passam o dia trocando print.
+- Quem não tem sixel vê a imagem em meio-bloco: dá pra saber o que é, não dá
+  pra ler texto miúdo num print de tela.

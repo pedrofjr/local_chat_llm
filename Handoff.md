@@ -119,9 +119,98 @@ Binário: LTO fat, `opt-level = "s"`, strip, panic=abort. Alvo &lt; 8 MB. Teams 
 
 ---
 
-## Onde paramos (18/ago/2026)
+## Onde paramos (19/ago/2026)
 
-Estado no git: branch `main`, versão **0.3.4**.
+Estado no git: branch `feat/imagens`, versão **0.4.0**. 85 testes, clippy
+limpo, exe em **6,40 MB** (teto 8).
+
+### Imagens, GIFs e figurinhas (0.4.0)
+
+Pedido do Pedro, com o desenho vindo dele: a imagem chega **fechada**, como
+uma linha `image (+)`, e só vira pixel quando alguém abre. Isso é o que salvou
+a feature — a objeção era que imagem num terminal destrói a fachada de client
+de LLM, e fechada por padrão a tela em repouso continua sendo texto.
+
+Escolhas travadas: entrada por **clipboard + `/img`**; GIF **anima de
+verdade**; imagem **sempre fechada**, abre só no clique/`Ctrl+G`.
+
+**Migração ratatui 0.29 → 0.30 + crossterm 0.28 → 0.29.** Exigida pela
+`ratatui-image` 11. Saiu sem tocar em uma linha de código: a superfície que
+usamos (`Span`, `Line`, `Paragraph`, `Style`, `Constraint`) não mudou e o
+backend continua re-exportado pelo crate principal. Medido antes de planejar,
+numa cópia no scratchpad, não estimado.
+
+**Custo real medido:** +544 KB de binário para PNG+JPEG+GIF+sixel+halfblocks.
+`chafa` (a dependência C que o README da crate menciona) **não existe** na
+11.0.6 — o encoder sixel é `icy_sixel`, Rust puro. O exe portátil sobrevive.
+
+#### Duas armadilhas que só apareceram rodando
+
+**1. `Picker::from_query_stdio()` não pode ser chamado com o app de pé.** É o
+construtor que todo exemplo usa. Ele liga raw mode e lê stdin cru esperando a
+resposta do terminal — enquanto o nosso `spawn_input_thread` já lê stdin em
+laço. As duas brigam pelos mesmos bytes: a resposta do terminal chega como
+tecla e a query espera para sempre. Rodando fora do app eu vi o processo
+pendurar e vazar `_Gi=31,s=1,...`, `[c`, `[16t` na tela.
+
+A detecção roda **uma vez**, em `run()`, depois do `enable_raw_mode()` e
+**antes** do `spawn_input_thread()` — a única janela segura — com deadline de
+3 s, e o resultado vai para `Settings.image_proto`. Nunca é repetida: uma
+segunda tentativa com o app rodando roubaria teclas. `/img proto` corrige na
+mão.
+
+**2. Os bytes da imagem não podem ir dentro do `Record`.** O `sync_loop` lê o
+lote com `read_to_end(2 MB)` e **engole o erro** (`if let Ok(buf)`). Uma
+imagem grande ali faria o **texto** parar de chegar, em silêncio. Somado a
+isso, `RoomLog` mantém `records` inteiro em memória. Daí o canal próprio:
+`SyncMsg::Want`/`Blob`, stream separado, teto de 4 MB, ALPN em `local-llm/3`.
+
+#### Como ficou
+
+- `Record::Image` no **fim** do enum (tag 7, `record_tags_never_move` estendido).
+  Carrega só a descrição. A assinatura cobre o **hash**, e `read_blob` recusa
+  blob cujo conteúdo parou de bater com o nome — junto, autentica os pixels
+  sem que passem pelo log.
+- Blob store cifrado em `blobs/<hash>.bin`, cota de 200 MB por sala com
+  despejo do mais antigo. `forget()` já apagava a pasta inteira, então some
+  junto sem código novo.
+- Busca **em background** ao receber o `Record`, não ao abrir: numa sala onde
+  todo mundo fecha o laptop às seis, puxar cedo é a diferença entre histórico
+  e link morto.
+- Render: `SlicedImage` para imagem cortada pela borda. Sem ele o widget
+  desiste em silêncio quando a área é menor que a imagem, e ela some inteira
+  ao rolar em vez de ser cortada.
+- GIF: quadros codificados uma vez ao abrir; animar depois é trocar índice. O
+  relógio do loop acorda no menor entre próximo quadro e sweep de presença, e
+  **para** quando fecha, sai da viewport ou o F12 entra.
+- Clipboard: PNG registrado > `CF_HDROP` > `CF_DIB`. O parser de DIB tem três
+  armadilhas silenciosas, todas com teste: altura positiva = linhas de baixo
+  para cima; linhas preenchidas até múltiplo de 4 bytes; e bitmap de 32 bits da
+  captura do Windows com **alpha todo zero**, que ao pé da letra deixa a
+  imagem invisível.
+- `Ctrl+V` só age se houver imagem de fato — no Windows o terminal costuma
+  engolir o `Ctrl+V` e injetar o texto ele mesmo, e sem essa guarda uma
+  colagem de texto sairia duplicada. `Ctrl+Shift+V` força.
+
+#### Validações que valem repetir
+
+- Dois endpoints iroh reais trocando um blob por QUIC in-process
+  (`a_peer_serves_the_pixels_it_holds`). Era uma dívida antiga: eu tinha me
+  comprometido a fazer isso antes de mexer em descoberta/protocolo de novo.
+- Clipboard real do Windows, não só bitmap sintético:
+  `cargo test reads_a_real_clipboard_picture -- --ignored --nocapture`.
+  Com um retângulo verde no canto superior esquerdo sobre fundo vermelho, sai
+  `TL [50,205,50]` e o resto `[200,40,40]` — confirma a inversão bottom-up e a
+  ordem BGR de uma vez.
+
+#### Ainda não verificado por mim
+
+- Sixel de verdade na tela: só um terminal real mostra. O Windows Terminal do
+  Pedro é 1.24, bem acima do 1.22 que estreou sixel.
+- Se o `KeyEvent` de `Ctrl+V` chega no Windows Terminal com imagem no
+  clipboard. Se não chegar, `Ctrl+Shift+V` e `/img` cobrem.
+- O grupo inteiro na 0.4.0: **ninguém sincroniza com versão antiga**, o ALPN
+  mudou.
 
 ### O bug que derrubou a sala (0.3.4)
 
