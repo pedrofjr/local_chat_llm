@@ -394,7 +394,16 @@ fn next_frame_due(app: &App) -> Option<Instant> {
 
 impl App {
     pub fn new() -> Result<Self> {
-        let dir = DataDir::open()?;
+        // A build started by an update has to wait for the one it replaced
+        // to let go of the first window slot. Grabbing the second one means a
+        // different data directory -- different rooms, and the two of them
+        // meeting through the presence file as if two windows were open on
+        // purpose. That is exactly what went wrong on the first real update.
+        let dir = if crate::update::was_just_updated() {
+            DataDir::open_after_update()?
+        } else {
+            DataDir::open()?
+        };
         let nick = dir.load_nick();
         let settings = dir.load_settings();
         let proto = settings.image_proto;
@@ -815,10 +824,21 @@ async fn run_inner(terminal: &mut Term) -> Result<()> {
 
     // Started by an update that just replaced us: the file we came from is
     // finally unlocked, so it can go.
-    if std::env::args().any(|a| a == crate::update::JUST_UPDATED) {
+    if crate::update::was_just_updated() {
         crate::update::sweep_previous();
-        app.status = format!("updated to {}", env!("CARGO_PKG_VERSION"));
+        let now = env!("CARGO_PKG_VERSION");
+        let said = match crate::update::updated_from() {
+            Some(before) if before != now => format!("updated — {before} to {now}"),
+            _ => format!("updated — now on {now}"),
+        };
+        // The room has to be reopened first: doing that clears the feed, so a
+        // notice written before it would be wiped exactly in the case that
+        // matters most.
         resume_room(&mut app, terminal).await;
+        // In the transcript rather than only the status bar, which the next
+        // network event overwrites within seconds -- and "did it actually
+        // update?" is the first thing anyone wants to know.
+        app.notice(said);
     }
 
     let mut events = spawn_input_thread();
@@ -2112,16 +2132,22 @@ async fn install_update<B: Backend>(
         }
     };
 
-    let resume = match &app.room {
-        Some(room) => Some(topic_hex(&topic_id(&room.lock().await.pin))),
-        None => None,
-    };
+    // Written through the app's own DataDir. Opening a fresh one here would
+    // claim a second window slot and put the note in `guest-2`, where the
+    // build that has to read it will never look.
+    if let Some(room) = &app.room {
+        let topic = topic_hex(&topic_id(&room.lock().await.pin));
+        let _ = crate::update::write_resume(&app.dir, &topic);
+    }
 
     app.status = "installing…".into();
     let _ = term.draw(|f| draw(f, app));
     app.shutdown_net().await;
+    // Let go of the window slot *before* the successor starts, or it will
+    // take the next one and open a different data directory entirely.
+    app.dir.release_slot();
 
-    match crate::update::install_and_relaunch(&bytes, resume.as_deref()) {
+    match crate::update::install_and_relaunch(&bytes) {
         Ok(()) => Ok(true),
         Err(e) => {
             app.close_overlay();
@@ -2201,7 +2227,7 @@ async fn diag(app: &mut App) {
 /// A locked one stops at its unlock screen rather than being skipped, so the
 /// restart does not quietly drop somebody out of the conversation.
 async fn resume_room<B: Backend>(app: &mut App, term: &mut Terminal<B>) {
-    let Some(topic_hex_wanted) = crate::update::take_resume() else {
+    let Some(topic_hex_wanted) = crate::update::take_resume(&app.dir) else {
         return;
     };
     let Some(row) = app

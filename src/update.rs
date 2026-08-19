@@ -275,7 +275,7 @@ async fn http_get(url: &str) -> Result<Vec<u8>> {
 ///
 /// Never returns on success -- the caller is expected to exit.
 #[cfg(windows)]
-pub fn install_and_relaunch(bytes: &[u8], resume: Option<&str>) -> Result<()> {
+pub fn install_and_relaunch(bytes: &[u8]) -> Result<()> {
     use std::fs;
 
     let exe = std::env::current_exe().context("cannot find our own executable")?;
@@ -294,19 +294,31 @@ pub fn install_and_relaunch(bytes: &[u8], resume: Option<&str>) -> Result<()> {
         return Err(e).context("could not put the new build in place");
     }
 
-    if let Some(topic) = resume {
-        let _ = write_resume(topic);
-    }
-
+    // Carries the version being left behind, so the new build can say what
+    // it came from rather than just asserting it is new.
     std::process::Command::new(&exe)
-        .arg(JUST_UPDATED)
+        .arg(format!("{JUST_UPDATED}={}", env!("CARGO_PKG_VERSION")))
         .spawn()
         .context("the new build did not start")?;
     Ok(())
 }
 
+/// The version we were updated from, if this start came from an update.
+pub fn updated_from() -> Option<String> {
+    std::env::args().find_map(|arg| {
+        arg.strip_prefix(JUST_UPDATED)
+            .and_then(|rest| rest.strip_prefix('='))
+            .map(str::to_string)
+    })
+}
+
+/// Whether this start came from an update at all.
+pub fn was_just_updated() -> bool {
+    std::env::args().any(|a| a.starts_with(JUST_UPDATED))
+}
+
 #[cfg(not(windows))]
-pub fn install_and_relaunch(_bytes: &[u8], _resume: Option<&str>) -> Result<()> {
+pub fn install_and_relaunch(_bytes: &[u8]) -> Result<()> {
     bail!("updating is only wired up for windows")
 }
 
@@ -319,25 +331,24 @@ pub fn sweep_previous() {
     }
 }
 
-/// Where the room to reopen after a restart is noted.
-fn resume_path() -> Option<std::path::PathBuf> {
-    crate::store::DataDir::open()
-        .ok()
-        .map(|dir| dir.resume_path())
+/// Notes which room to reopen.
+///
+/// Takes the caller's `DataDir` rather than opening its own: opening one
+/// claims a window slot, and a second slot means a *different* profile
+/// directory. Written from a freshly opened `DataDir`, this note would land
+/// in `guest-2` while the app that has to read it lives in the main profile.
+///
+/// Only the topic goes in -- the key never does. A room whose key is
+/// remembered reopens by itself; a locked one stops at the unlock screen,
+/// which is the correct outcome.
+pub fn write_resume(dir: &crate::store::DataDir, topic_hex: &str) -> Result<()> {
+    std::fs::write(dir.resume_path(), topic_hex).context("could not note the room to reopen")
 }
 
-/// Notes which room to reopen. Deliberately only the topic -- the key is never
-/// written here. A room whose key is remembered reopens by itself; one that is
-/// locked stops at the unlock screen, which is the correct outcome.
-fn write_resume(topic_hex: &str) -> Result<()> {
-    let path = resume_path().ok_or_else(|| anyhow!("no data dir"))?;
-    std::fs::write(path, topic_hex).context("could not note the room to reopen")
-}
-
-/// Reads and clears the note. One shot: a stale file must not reopen a room
-/// on some unrelated start weeks later.
-pub fn take_resume() -> Option<String> {
-    let path = resume_path()?;
+/// Reads and clears the note. One shot: a stale file must not reopen a room on
+/// some unrelated start weeks later.
+pub fn take_resume(dir: &crate::store::DataDir) -> Option<String> {
+    let path = dir.resume_path();
     let topic = std::fs::read_to_string(&path).ok()?;
     let _ = std::fs::remove_file(&path);
     let topic = topic.trim().to_string();
@@ -579,6 +590,28 @@ mod tests {
         assert_eq!(std::fs::read(&retired).unwrap(), b"running");
     }
 
+    /// The second half of the wrong-room bug: the note itself was written
+    /// through a freshly opened `DataDir`, which claims a window slot. With
+    /// the app already holding slot 1, that fresh one became slot 2 and the
+    /// note went to `guest-2` -- somewhere the app would never read it.
+    #[test]
+    fn the_resume_note_lands_in_the_profile_that_will_read_it() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = crate::store::DataDir::from_path(tmp.path().to_path_buf()).unwrap();
+        let topic = "b".repeat(64);
+
+        write_resume(&dir, &topic).unwrap();
+        assert!(
+            dir.resume_path().exists(),
+            "the note must be in this profile, not a sibling one"
+        );
+
+        // And it is read back from the same place, once.
+        assert_eq!(take_resume(&dir).as_deref(), Some(topic.as_str()));
+        assert_eq!(take_resume(&dir), None, "a note is good for one restart");
+        assert!(!dir.resume_path().exists(), "and is cleared after reading");
+    }
+
     #[test]
     fn the_resume_note_carries_a_room_and_never_a_key() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -629,6 +662,29 @@ mod tests {
         // And it must actually be a Windows executable, not an error page
         // that happened to hash correctly.
         assert_eq!(&bytes[..2], b"MZ", "that is not a windows executable");
+    }
+
+    #[test]
+    fn the_relaunch_argument_carries_the_version_it_came_from() {
+        // Shape of what `install_and_relaunch` passes on.
+        let arg = format!("{JUST_UPDATED}=0.6.0");
+        assert!(arg.starts_with(JUST_UPDATED), "must still be recognisable");
+
+        let parsed = arg
+            .strip_prefix(JUST_UPDATED)
+            .and_then(|rest| rest.strip_prefix('='));
+        assert_eq!(parsed, Some("0.6.0"), "so the notice can say where from");
+
+        // The bare form, from a build old enough not to send a version, must
+        // still register as an update rather than being ignored.
+        assert!(JUST_UPDATED.starts_with(JUST_UPDATED));
+        assert_eq!(
+            JUST_UPDATED
+                .strip_prefix(JUST_UPDATED)
+                .and_then(|r| r.strip_prefix('=')),
+            None,
+            "no version attached, and that is fine"
+        );
     }
 
     #[test]

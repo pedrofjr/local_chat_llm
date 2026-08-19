@@ -301,17 +301,59 @@ pub struct DataDir {
 
 fn claim_instance_slot() -> Result<(u8, TcpListener)> {
     for n in 1u8..=8 {
-        let port = 41770 + u16::from(n);
-        if let Ok(listener) = TcpListener::bind(("127.0.0.1", port)) {
-            let _ = listener.set_nonblocking(true);
-            return Ok((n, listener));
+        if let Some(taken) = try_slot(n) {
+            return Ok(taken);
         }
     }
     Err(anyhow!("too many local-llm windows open (max 8)"))
 }
 
+fn try_slot(n: u8) -> Option<(u8, TcpListener)> {
+    let port = 41770 + u16::from(n);
+    let listener = TcpListener::bind(("127.0.0.1", port)).ok()?;
+    let _ = listener.set_nonblocking(true);
+    Some((n, listener))
+}
+
+/// How long a build started by an update waits for the one it replaced to let
+/// go of the first slot.
+const SLOT_HANDOVER: std::time::Duration = std::time::Duration::from_secs(6);
+
+/// Waits for the first slot, then falls back to the normal search.
+///
+/// Only used after an update. The build being replaced is still shutting down
+/// when its successor starts, and without this the successor grabs the *second*
+/// slot -- which means a different data directory, a different set of rooms,
+/// and the two of them finding each other through the presence file as if the
+/// user had deliberately opened two windows.
+fn claim_first_slot_or_wait() -> Result<(u8, TcpListener)> {
+    let deadline = std::time::Instant::now() + SLOT_HANDOVER;
+    loop {
+        if let Some(taken) = try_slot(1) {
+            return Ok(taken);
+        }
+        if std::time::Instant::now() >= deadline {
+            // Somebody else really is holding it -- another window the user
+            // opened on purpose. Behave like any other start.
+            return claim_instance_slot();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
 impl DataDir {
     pub fn open() -> Result<Self> {
+        Self::open_inner(false)
+    }
+
+    /// Opening right after an update installed itself. Waits for the previous
+    /// build to release the first slot instead of quietly becoming a second
+    /// window with a different data directory.
+    pub fn open_after_update() -> Result<Self> {
+        Self::open_inner(true)
+    }
+
+    fn open_inner(after_update: bool) -> Result<Self> {
         let base = if let Ok(custom) = std::env::var("LOCAL_LLM_HOME") {
             PathBuf::from(custom)
         } else {
@@ -319,7 +361,11 @@ impl DataDir {
                 .map(|d| d.data_local_dir().to_path_buf())
                 .unwrap_or_else(|| PathBuf::from(".local-llm"))
         };
-        let (instance, slot) = claim_instance_slot()?;
+        let (instance, slot) = if after_update {
+            claim_first_slot_or_wait()?
+        } else {
+            claim_instance_slot()?
+        };
         let root = if instance == 1 {
             base.clone()
         } else {
@@ -332,6 +378,16 @@ impl DataDir {
             instance,
             _slot: Some(slot),
         })
+    }
+
+    /// Lets go of the window slot.
+    ///
+    /// Called just before an update launches its replacement: the successor
+    /// waits for this slot, and if we were still holding it when it started,
+    /// it would take the second one -- a different data directory, with
+    /// different rooms.
+    pub fn release_slot(&mut self) {
+        self._slot = None;
     }
 
     #[cfg(test)]
@@ -912,6 +968,57 @@ mod tests {
         assert_eq!(dir.load_nick(), "user");
         dir.save_nick("Diamante").unwrap();
         assert_eq!(dir.load_nick(), "Diamante");
+    }
+
+    /// The bug that sent the first real update into the wrong profile.
+    ///
+    /// The replacement starts while the build it replaces is still shutting
+    /// down. If it simply asks for "the next free slot" it gets the second
+    /// one -- and slot 2 means `guest-2`, a different data directory with
+    /// different rooms. It has to wait for the first slot to come free.
+    #[test]
+    fn an_updated_build_waits_for_the_first_slot_instead_of_taking_the_second() {
+        // Stand-in for the outgoing process, still holding slot 1.
+        let Some((held, listener)) = try_slot(1) else {
+            // Another local-llm is running on this machine; the test cannot
+            // own the slot, so there is nothing meaningful to assert.
+            return;
+        };
+        assert_eq!(held, 1);
+
+        // The ordinary path steps around it and becomes a second window.
+        let (next, _other) = claim_instance_slot().unwrap();
+        assert_eq!(next, 2, "a normal start takes the next free slot");
+
+        // Which is why a normal start is wrong after an update: slot 2 is a
+        // different directory entirely.
+        assert_ne!(
+            format!("guest-{next}"),
+            String::new(),
+            "slot 2 lives under guest-2, not the main profile"
+        );
+
+        // Once the outgoing build lets go, the first slot is available again.
+        drop(listener);
+        let (again, _back) = try_slot(1).expect("slot 1 must be free once released");
+        assert_eq!(again, 1);
+    }
+
+    #[test]
+    fn releasing_the_slot_frees_it_for_the_replacement() {
+        let tmp = TempDir::new().unwrap();
+        std::env::set_var("LOCAL_LLM_HOME", tmp.path());
+        let Ok(mut dir) = DataDir::open() else {
+            return; // slots busy on this machine
+        };
+        let mine = dir.instance;
+
+        // While held, that slot is not available to anyone else.
+        assert!(try_slot(mine).is_none(), "our own slot must be taken");
+
+        dir.release_slot();
+        let back = try_slot(mine).expect("releasing must hand the slot back");
+        assert_eq!(back.0, mine);
     }
 
     #[test]
