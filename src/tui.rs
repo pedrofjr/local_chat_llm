@@ -1592,7 +1592,39 @@ async fn handle_chat<B: Backend>(
     Ok(false)
 }
 
+/// The other end of the whisper the pending reply points at, if it points at
+/// a whisper at all.
+fn whisper_being_answered(app: &App) -> Option<[u8; 32]> {
+    let key = app.replying?;
+    let at = *app.by_key.get(&key)?;
+    match app.feed.get(at) {
+        Some(Feed::Msg {
+            whisper: Some(them),
+            ..
+        }) => Some(*them),
+        _ => None,
+    }
+}
+
 async fn send(app: &mut App, body: String) {
+    // Answering a whisper out loud is refused, and this is the one place that
+    // can tell. The danger is not that the room reads the whisper -- it
+    // cannot, the quote degrades to "not here yet" for anyone who cannot open
+    // it. It is that *we* see the quote in full, attached to a public message,
+    // and write the next sentence as if everyone shared that context.
+    if let Some(them) = whisper_being_answered(app) {
+        let who = app
+            .names
+            .get(&them)
+            .cloned()
+            .unwrap_or_else(|| "them".into());
+        // Handed back as a ready command rather than thrown away: one Enter
+        // sends it privately, Esc drops the quote and it goes to the room.
+        app.input.clear();
+        app.input.insert_str(&format!("/w {who} {}", body.trim()));
+        app.status = format!("that is a whisper — enter sends it to {who}, esc drops the quote");
+        return;
+    }
     let Some(room) = app.room.clone() else { return };
     let reply = app.replying;
     let rec = {
@@ -4069,6 +4101,138 @@ mod tests {
             }
             _ => panic!("expected a message"),
         }
+    }
+
+    /// What a bystander sees when somebody answers a whisper **out loud**.
+    ///
+    /// Two other people whisper to each other; one of them then quotes that
+    /// whisper in an ordinary message. We are the third person: we hold the
+    /// whisper record and cannot open it, so the question is whether the quote
+    /// hands us its contents anyway.
+    #[tokio::test]
+    async fn quoting_a_whisper_in_public_must_not_hand_it_to_the_room() {
+        let mut h = Harness::new();
+        h.cmd("/new gpt-oss-20b").await;
+        let room = h.app.room.clone().unwrap();
+
+        // Two real people, on their own machines, with their own keys.
+        let (ta, tb) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let pin = { room.lock().await.pin.clone() };
+        let mut ana = OpenRoom::join(
+            &crate::store::DataDir::from_path(ta.path().to_path_buf()).unwrap(),
+            pin.clone(),
+            Some("sala"),
+        )
+        .unwrap();
+        let mut bia = OpenRoom::join(
+            &crate::store::DataDir::from_path(tb.path().to_path_buf()).unwrap(),
+            pin,
+            Some("sala"),
+        )
+        .unwrap();
+        let ia = ana.announce_identity().unwrap().unwrap();
+        let ib = bia.announce_identity().unwrap().unwrap();
+        bia.ingest(ia.clone()).unwrap();
+        ana.ingest(ib.clone()).unwrap();
+
+        // Ana whispers to Bia. We receive the record like everybody else.
+        let secret = ana
+            .compose_whisper(bia.author, "o chefe vai demitir o Carlos".into(), None)
+            .unwrap();
+        let answered = secret.chat_key().unwrap();
+
+        // Bia answers it *out loud*, quoting the whisper.
+        bia.ingest(secret.clone()).unwrap();
+        let aloud = bia.compose("serio isso?".into(), Some(answered)).unwrap();
+
+        {
+            let mut room = room.lock().await;
+            room.ingest(ia).unwrap();
+            room.ingest(ib).unwrap();
+            room.ingest(secret).unwrap();
+            room.ingest(aloud).unwrap();
+        }
+        sync_feed(&mut h.app).await;
+
+        let screen = h.painted();
+        assert!(
+            screen.contains("serio isso?"),
+            "the public answer itself is public, and should show"
+        );
+        assert!(
+            !screen.contains("demitir"),
+            "the whisper's text must never reach a bystander's screen"
+        );
+        assert!(
+            !screen.contains("chefe"),
+            "not even part of it"
+        );
+        // The whisper is not in our feed at all, so there is nothing to quote
+        // from -- the quote degrades to a placeholder.
+        assert!(
+            screen.contains("not here yet"),
+            "the quote should read as missing, got:\n{screen}"
+        );
+    }
+
+    /// The dangerous half of the same situation: what the *sender* sees.
+    ///
+    /// We can open the whisper, so on our screen the quote renders in full --
+    /// attached to a message everybody else can read. That is how somebody
+    /// writes "pois e, melhor nao contar pro Carlos" believing the context is
+    /// there, and leaks the whisper in their own words.
+    #[tokio::test]
+    async fn answering_a_whisper_out_loud_shows_us_a_context_nobody_else_has() {
+        let mut h = Harness::new();
+        h.cmd("/new gpt-oss-20b").await;
+        let them = peer_who_can_be_whispered_to(&mut h.app, "Diamante").await;
+
+        // A whisper we received and can read.
+        let room = h.app.room.clone().unwrap();
+        let seq = { room.lock().await.log.next_seq_for(&them) };
+        h.app.by_key.insert((them, seq), h.app.feed.len());
+        h.app.feed.push(Feed::Msg {
+            author: them,
+            seq,
+            name: "Diamante".into(),
+            mine: false,
+            body: "o chefe vai demitir o Carlos".into(),
+            ts: now_ts(),
+            reply_to: None,
+            // `whisper` holds the *other* end: for one we received, the sender.
+            whisper: Some(them),
+            image: None,
+        });
+
+        let last = h.app.feed.len() - 1;
+        arm_reply(&mut h.app, last);
+        send(&mut h.app, "serio isso?".into()).await;
+
+        let screen = h.painted();
+        assert!(
+            !screen.contains("serio isso?") || h.app.input.text.contains("serio isso?"),
+            "the public message must not have gone out with a whisper quoted              onto it:
+{screen}"
+        );
+
+        // Nothing was sent; what we typed comes back as a ready whisper.
+        assert_eq!(
+            h.app.input.text, "/w Diamante serio isso?",
+            "the text must not be thrown away -- it comes back one Enter from              going privately"
+        );
+        assert!(
+            h.app.status.contains("whisper"),
+            "and it has to say why, got {:?}",
+            h.app.status
+        );
+        assert!(
+            h.app.replying.is_some(),
+            "the quote stays armed so the whisper can still carry it"
+        );
+
+        // Esc drops the quote, and the same text then goes to the room.
+        h.press(KeyCode::Esc).await;
+        assert!(h.app.replying.is_none(), "esc has to release the quote");
     }
 
     /// The quote lives inside the ciphertext, so the disguise -- which drops

@@ -101,6 +101,16 @@ mande o `/w` normalmente. A citação viaja **dentro** do texto cifrado, então
 os outros continuam sem saber sequer que você respondeu àquela mensagem — de
 fora, o metadado é o mesmo de qualquer sussurro.
 
+O caminho contrário é barrado: se você marcar um **sussurro** e escrever uma
+mensagem comum, ela não sai. O texto volta pronto como `/w Fulano ...` — um
+Enter manda em privado, `Esc` solta a citação e aí vai pra sala.
+
+O motivo não é o que parece. A sala **não** conseguiria ler o sussurro citado:
+quem não tem a chave vê `(message not here yet)` no lugar. O risco é o
+inverso — **você** veria a citação inteira na sua tela, colada numa mensagem
+pública, e escreveria a frase seguinte como se todo mundo tivesse aquele
+contexto. É assim que o sussurro vaza pelas suas próprias palavras.
+
 No `F12` os sussurros **somem da tela** por inteiro, e as citações também —
 elas carregariam um nome real através do disfarce.
 
