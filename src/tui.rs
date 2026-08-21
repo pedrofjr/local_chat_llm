@@ -308,6 +308,10 @@ pub struct App {
     /// into a feed slot is unreadable, and reading it is usually the point of
     /// having sent it.
     zoom: Option<Zoom>,
+    /// Set once a new build is installed and waiting to take over. Acted on
+    /// only after the terminal has been put back, because the successor
+    /// configures the console the moment it starts and we must not undo that.
+    relaunch: bool,
     /// Set when a picture stops being drawn, and consumed by the next frame.
     ///
     /// Sixel is not text: the terminal keeps those pixels on its own layer,
@@ -503,6 +507,7 @@ impl App {
             shots: HashMap::new(),
             proto,
             zoom: None,
+            relaunch: false,
             wipe_pixels: false,
             pending_expand: None,
             pending_zoom: None,
@@ -755,7 +760,16 @@ pub async fn run() -> Result<()> {
         LeaveAlternateScreen
     )?;
     terminal.show_cursor()?;
-    result
+
+    // Dead last, and that placement is the whole point: everything above puts
+    // the console back the way it was found, and the successor configures it
+    // for itself the moment it starts. Handing over any earlier means undoing
+    // its setup right after it made it.
+    if matches!(result, Ok(true)) {
+        crate::update::relaunch()?;
+        return Ok(());
+    }
+    result.map(|_| ())
 }
 
 /// How long we wait for the terminal to say what it can draw. Windows Terminal
@@ -890,9 +904,12 @@ impl Burst {
     }
 }
 
-fn spawn_input_thread() -> mpsc::UnboundedReceiver<(Event, bool)> {
+fn spawn_input_thread() -> (
+    mpsc::UnboundedReceiver<(Event, bool)>,
+    std::thread::JoinHandle<()>,
+) {
     let (tx, rx) = mpsc::unbounded_channel();
-    std::thread::Builder::new()
+    let handle = std::thread::Builder::new()
         .name("input".into())
         .spawn(move || {
             let mut burst = Burst::default();
@@ -925,10 +942,10 @@ fn spawn_input_thread() -> mpsc::UnboundedReceiver<(Event, bool)> {
             }
         })
         .expect("input thread");
-    rx
+    (rx, handle)
 }
 
-async fn run_inner(terminal: &mut Term) -> Result<()> {
+async fn run_inner(terminal: &mut Term) -> Result<bool> {
     let mut app = App::new()?;
 
     // Started by an update that just replaced us: the file we came from is
@@ -954,7 +971,7 @@ async fn run_inner(terminal: &mut Term) -> Result<()> {
         app.notice(said);
     }
 
-    let mut events = spawn_input_thread();
+    let (mut events, reader) = spawn_input_thread();
     loop {
         // Frames advance before the draw, so what is painted is what is due.
         tick_animations(&mut app);
@@ -1018,7 +1035,13 @@ async fn run_inner(terminal: &mut Term) -> Result<()> {
         }
     }
     app.shutdown_net().await;
-    Ok(())
+    // Stop reading the console before anyone else starts. Dropping the
+    // receiver ends the thread within one poll interval, and joining makes
+    // that certain rather than likely -- a successor and a leftover reader on
+    // the same input buffer is exactly the failure being avoided here.
+    drop(events);
+    let _ = reader.join();
+    Ok(app.relaunch)
 }
 
 /// Drops whoever stopped beating, and says so once.
@@ -2403,8 +2426,13 @@ async fn install_update<B: Backend>(
     // take the next one and open a different data directory entirely.
     app.dir.release_slot();
 
-    match crate::update::install_and_relaunch(&bytes) {
-        Ok(()) => Ok(true),
+    // Only installs. Starting the replacement is the last thing that happens,
+    // after the terminal has been handed back -- see `update::relaunch`.
+    match crate::update::install(&bytes) {
+        Ok(()) => {
+            app.relaunch = true;
+            Ok(true)
+        }
         Err(e) => {
             app.close_overlay();
             app.status = format!("could not install: {e}");

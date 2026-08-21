@@ -12,6 +12,32 @@ Para atualizar, `/update` dentro do app ou `local-llm update` no terminal.
 
 ---
 
+## 0.7.3 — 21/08/2026
+
+**Corrigido — depois do `/update`, o teclado ia para o PowerShell**
+
+O app voltava para a conversa, continuava desenhando na tela, e não recebia
+mais nenhuma tecla — como se o terminal tivesse voltado a ser um prompt de
+comando. Eram dois defeitos empilhados, e cada um sozinho já bastaria.
+
+- **O processo que saía desfazia a configuração de quem entrava.** A versão
+  nova começa ligando o modo bruto do teclado e entrando na tela alternada. A
+  versão velha, que ainda estava terminando de sair, então desligava o modo
+  bruto e saía da tela alternada — num console que já pertencia à outra. Daí a
+  combinação estranha: a nova continuava desenhando (na tela comum, porque a
+  antiga a tirou da alternada) num console de volta ao modo linha.
+  Agora a troca é a **última** coisa que acontece, depois de o terminal já ter
+  sido devolvido.
+- **O PowerShell voltava a ler o teclado.** Ele espera o processo que lançou;
+  a versão nova é neta dele, então no instante em que a antiga saía, o prompt
+  voltava e passava a disputar as teclas com o app. Quem ganhava era o prompt.
+  Agora a versão antiga **espera** a nova terminar antes de sair, então o
+  shell continua ocupado e o console tem um dono só.
+
+Efeito colateral aceito: o arquivo da versão substituída (`local-llm.old`) só
+é apagado na abertura seguinte, porque o processo antigo fica vivo segurando
+ele enquanto você usa o app.
+
 ## 0.7.2 — 21/08/2026
 
 A tela cheia da 0.7.0 tinha um defeito grave e a qualidade continuava ruim por

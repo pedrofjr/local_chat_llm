@@ -301,19 +301,37 @@ pub fn install(_bytes: &[u8]) -> Result<()> {
     bail!("updating is only wired up for windows")
 }
 
-/// Installs and hands over to the replacement. Used by the in-app command,
-/// where the user is sitting in front of a window that has to come back.
 #[cfg(windows)]
-pub fn install_and_relaunch(bytes: &[u8]) -> Result<()> {
-    install(bytes)?;
+/// Starts the build that replaced us and stays until it is done.
+///
+/// Must be called **after** the terminal has been put back the way it was
+/// found, and never before. Two things go wrong otherwise, and together they
+/// look like the app broke rather than like a race:
+///
+/// The successor turns raw mode on and enters the alternate screen the moment
+/// it starts. If we are still on our way out, we then turn raw mode off and
+/// leave the alternate screen -- on a console that now belongs to it. It goes
+/// on drawing, onto the ordinary screen, into a console back in line mode.
+///
+/// And we wait rather than exiting, because the shell is waiting on *us*. The
+/// successor is its grandchild, so the moment we exit it prints a prompt and
+/// starts reading the console. Two readers on one input buffer, and the shell
+/// is the one that gets the keys: the app is visibly alive and answers nothing.
+pub fn relaunch() -> Result<()> {
     let exe = std::env::current_exe().context("cannot find our own executable")?;
     // Carries the version being left behind, so the new build can say what
     // it came from rather than just asserting it is new.
-    std::process::Command::new(&exe)
+    let mut child = std::process::Command::new(&exe)
         .arg(format!("{JUST_UPDATED}={}", env!("CARGO_PKG_VERSION")))
         .spawn()
         .context("the new build did not start")?;
+    let _ = child.wait();
     Ok(())
+}
+
+#[cfg(not(windows))]
+pub fn relaunch() -> Result<()> {
+    bail!("updating is only wired up for windows")
 }
 
 /// The version we were updated from, if this start came from an update.
@@ -328,11 +346,6 @@ pub fn updated_from() -> Option<String> {
 /// Whether this start came from an update at all.
 pub fn was_just_updated() -> bool {
     std::env::args().any(|a| a.starts_with(JUST_UPDATED))
-}
-
-#[cfg(not(windows))]
-pub fn install_and_relaunch(_bytes: &[u8]) -> Result<()> {
-    bail!("updating is only wired up for windows")
 }
 
 /// Removes the build we replaced. Called by the new build on its first run,
