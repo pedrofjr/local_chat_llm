@@ -1352,6 +1352,46 @@ mod tests {
         );
     }
 
+    /// A settings file written by a build that never measured the cell has a
+    /// protocol and nothing else. It has to read back as "still needs asking",
+    /// or the people most affected -- everyone already running the app -- keep
+    /// drawing against a guessed cell forever.
+    #[test]
+    fn settings_from_before_the_cell_was_measured_still_need_asking() {
+        let tmp = TempDir::new().unwrap();
+        let dir = DataDir::from_path(tmp.path().to_path_buf()).unwrap();
+        fs::write(
+            dir.settings_path(),
+            "notify = \"all\"\nsnooze_until = 0\npaste_detect = true\nimage_proto = \"Sixel\"\n",
+        )
+        .unwrap();
+
+        let settings = dir.load_settings();
+        assert_eq!(settings.image_proto, ImageProto::Sixel, "kept what it had");
+        assert_eq!(settings.cell_w, 0, "and nothing was ever measured");
+        assert_eq!(
+            settings.cell(),
+            (10, 20),
+            "an unmeasured cell falls back rather than reading as zero-wide"
+        );
+    }
+
+    #[test]
+    fn a_measured_cell_survives_the_round_trip() {
+        let tmp = TempDir::new().unwrap();
+        let dir = DataDir::from_path(tmp.path().to_path_buf()).unwrap();
+        let settings = Settings {
+            image_proto: ImageProto::Sixel,
+            cell_w: 8,
+            cell_h: 19,
+            ..Settings::default()
+        };
+        dir.save_settings(&settings).unwrap();
+
+        let back = dir.load_settings();
+        assert_eq!(back.cell(), (8, 19));
+    }
+
     #[test]
     fn forget_wipes_room() {
         let tmp = TempDir::new().unwrap();

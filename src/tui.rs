@@ -744,7 +744,13 @@ const PROTO_QUERY_WAIT: Duration = Duration::from_secs(3);
 fn settle_image_proto() {
     let Ok(dir) = DataDir::open() else { return };
     let mut settings = dir.load_settings();
-    if settings.image_proto != ImageProto::Unknown {
+    // Both answers have to be on file, not just the protocol. A settings file
+    // written before the cell was recorded has a protocol and no measurement,
+    // and checking only the protocol would leave exactly those installs --
+    // everyone who already ran an older build -- drawing against a guessed
+    // cell forever, which is the bug this measurement exists to fix.
+    let settled = settings.image_proto != ImageProto::Unknown && settings.cell_w != 0;
+    if settled {
         return;
     }
     // On its own thread with a deadline: the query can block on a terminal
@@ -767,16 +773,31 @@ fn settle_image_proto() {
                     } else {
                         ImageProto::Halfblocks
                     };
-                    (proto, size.width, size.height)
+                    // A zero here would read as "never measured" and make
+                    // every start ask again.
+                    let w = if size.width == 0 {
+                        CELL_W as u16
+                    } else {
+                        size.width
+                    };
+                    let h = if size.height == 0 {
+                        CELL_H as u16
+                    } else {
+                        size.height
+                    };
+                    (proto, w, h)
                 }
-                Err(_) => (ImageProto::Halfblocks, 0, 0),
+                // A terminal that will not answer still counts as answered:
+                // write the assumed cell down rather than leaving a zero, or
+                // every future start pays the query timeout again.
+                Err(_) => (ImageProto::Halfblocks, CELL_W as u16, CELL_H as u16),
             };
             let _ = tx.send(found);
         })
         .ok();
     let (proto, cell_w, cell_h) = rx
         .recv_timeout(PROTO_QUERY_WAIT)
-        .unwrap_or((ImageProto::Halfblocks, 0, 0));
+        .unwrap_or((ImageProto::Halfblocks, CELL_W as u16, CELL_H as u16));
     settings.image_proto = proto;
     settings.cell_w = cell_w;
     settings.cell_h = cell_h;

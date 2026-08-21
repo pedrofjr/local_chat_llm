@@ -12,6 +12,19 @@ Para atualizar, `/update` dentro do app ou `local-llm update` no terminal.
 
 ---
 
+## 0.7.1 — 21/08/2026
+
+**Corrigido**
+
+- A medição do tamanho de caractere que a 0.7.0 introduziu nunca ia acontecer
+  em quem já usava o app. A verificação de "já sei desenhar aqui" olhava só o
+  protocolo, e quem já tinha o protocolo gravado saía antes de medir — ou
+  seja, exatamente as quatro pessoas que a correção existia para atender
+  continuariam com o chute de 10×20. Agora a conta só é dada por encerrada
+  quando as duas respostas estão no arquivo.
+- Um terminal que não responde passa a ter o valor assumido gravado, em vez de
+  deixar o campo zerado e pagar os 3 segundos da consulta em toda abertura.
+
 ## 0.7.0 — 21/08/2026
 
 Uma rodada inteira em cima da experiência com imagens, que estava ruim nas
