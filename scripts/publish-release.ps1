@@ -50,6 +50,25 @@ if (-not (Test-Path $KeyFile)) { throw "key file not found: $KeyFile" }
 $keyHex = (Get-Content $KeyFile -Raw).Trim()
 if ($keyHex -notmatch '^[0-9a-fA-F]{64}$') { throw 'key file must hold 64 hex characters' }
 
+# --- notes, from the CHANGELOG -------------------------------------------
+# O texto que o grupo lê ao atualizar sai do mesmo lugar onde o repositório
+# guarda o histórico, e é conferido aqui em cima -- antes do build -- para uma
+# versão sem seção parar em um segundo, e não depois de cinco minutos de cargo.
+#
+# Falhar em vez de publicar um texto genérico é o ponto: era o genérico que
+# fazia o release não dizer o que mudou.
+Step 'reading the release notes'
+$changelog = Get-Content 'CHANGELOG.md' -Raw
+$heading = [regex]::Escape($version)
+$section = [regex]::Match($changelog, "(?ms)^##\s+$heading(?![\d.]).*?(?=^##\s|\z)")
+if (-not $section.Success) { throw "CHANGELOG.md has no section for $version - write it first" }
+# Fora o cabeçalho: o título do release já diz a versão.
+$body = ($section.Value -replace '(?m)\A##\s.*\r?\n', '').Trim()
+if (-not $body) { throw "the CHANGELOG section for $version is empty" }
+$footer = (Get-Content (Join-Path $PSScriptRoot 'release-footer.md') -Raw).Trim()
+$notesPath = Join-Path ([IO.Path]::GetTempPath()) "local-llm-notes-$version.md"
+Set-Content -LiteralPath $notesPath -Value "$body`n`n$footer" -Encoding utf8NoBOM
+
 # --- build ----------------------------------------------------------------
 Step 'cargo test'
 cargo test --quiet
@@ -138,23 +157,11 @@ git push origin $tag 2>$null
 if ($LASTEXITCODE -ne 0) { git push upstream $tag }
 
 Step 'creating the release'
-# As notas seguem o idioma do README (portugues). A interface do app fica em
-# ingles, para combinar com a fachada de client de modelo -- sao publicos
-# diferentes: o release e lido por quem instala, a UI por quem passa atras.
-$notes = @"
-Rode ``/update`` numa versao anterior para instalar esta.
-
-O download passa pelo proprio app, entao o arquivo nao recebe o carimbo de
-"veio da internet" e o SmartScreen nao entra na frente. O binario e conferido
-pelo sha256 e pela assinatura antes de substituir o que esta rodando.
-
-Todos precisam estar na mesma versao: mensagens ao vivo passam entre versoes
-diferentes, mas o historico nao sincroniza.
-"@
 gh release create $tag $exe $manifestPath `
     --repo pedrofjr/local_chat_llm `
     --title "local-llm $version" `
-    --notes $notes
+    --notes-file $notesPath
 if ($LASTEXITCODE -ne 0) { throw 'gh release create failed' }
+Remove-Item -LiteralPath $notesPath -ErrorAction SilentlyContinue
 
 Step "done - $tag is live, /update will find it"
