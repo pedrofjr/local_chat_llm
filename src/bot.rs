@@ -196,6 +196,15 @@ fn say(line: &str) {
     let _ = out.flush();
 }
 
+/// The integration guide, printed by `local-llm bot --help`.
+///
+/// Embedded from the same file the repository publishes, so the copy in a
+/// running binary can never drift from the behaviour it describes -- which is
+/// the failure mode of documentation an agent is asked to trust. Whoever is
+/// integrating can ask the program itself instead of finding the right version
+/// of a file somewhere.
+pub const GUIDE: &str = include_str!("../docs/BOT.md");
+
 /// Runs the room headless until stdin closes.
 pub async fn run(pin: &str, nick: Option<&str>) -> Result<()> {
     let dir = DataDir::open().context("open the data directory")?;
@@ -537,6 +546,61 @@ mod tests {
             text_of(r#"{"id":7,"text":"depois de outro campo"}"#).unwrap(),
             "depois de outro campo"
         );
+    }
+
+    /// The guide is what an agent is handed instead of the source, so it has
+    /// to describe every kind of line this module can actually emit. A new
+    /// event type added without a word in the guide leaves whoever integrates
+    /// parsing something nobody told them about -- and the failure shows up on
+    /// their side, as an unknown `type`, long after the change.
+    #[test]
+    fn the_guide_documents_every_line_the_bot_can_emit() {
+        let samples = [
+            Out::Ready {
+                room: "r",
+                nick: "n",
+                author: "a",
+                online: true,
+            }
+            .line(),
+            Out::Message {
+                from: "f",
+                author: "a",
+                text: "t",
+                ts: 0,
+                mine: false,
+                mentioned: false,
+                whisper: Some("w"),
+            }
+            .line(),
+            Out::Sent {
+                text: "t",
+                delivered: true,
+            }
+            .line(),
+            Out::Error { message: "m" }.line(),
+        ];
+
+        for line in samples {
+            // `{"type":"ready",...` -> `ready`
+            let kind = line
+                .split("\"type\":\"")
+                .nth(1)
+                .and_then(|rest| rest.split('"').next())
+                .expect("every line carries a type");
+            assert!(
+                GUIDE.contains(&format!("`{kind}`")),
+                "the guide never mentions the `{kind}` line"
+            );
+        }
+
+        // The fields a bot is expected to branch on, named in the guide.
+        for field in ["mentioned", "delivered", "whisper", "online", "author"] {
+            assert!(
+                GUIDE.contains(field),
+                "the guide does not explain the `{field}` field"
+            );
+        }
     }
 
     #[test]

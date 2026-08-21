@@ -23,6 +23,7 @@ local-llm
   local-llm bot --room <PIN> [--nick <name>]
                        join a room as a program: one json object per line
                        out, one json object per line in
+  local-llm bot --help print the whole integration guide and exit
 ";
 
 fn main() -> anyhow::Result<()> {
@@ -44,10 +45,19 @@ fn main() -> anyhow::Result<()> {
                 let at = args.iter().position(|a| a == name)?;
                 args.get(at + 1).cloned()
             };
+            // The whole integration guide, so a program being wired up can
+            // ask the binary rather than hunt for a document that may or may
+            // not match the version installed.
+            if args.iter().any(|a| a == "--help" || a == "-h" || a == "help") {
+                print!("{}", bot::GUIDE);
+                return Ok(());
+            }
             match flag("--room").or_else(|| flag("--pin")) {
                 Some(pin) => rt.block_on(bot::run(&pin, flag("--nick").as_deref())),
                 None => {
                     eprintln!("local-llm bot: --room <PIN> is required
+");
+                    eprintln!("run `local-llm bot --help` for the whole protocol
 ");
                     eprint!("{USAGE}");
                     std::process::exit(2);

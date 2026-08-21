@@ -12,6 +12,24 @@ Para atualizar, `/update` dentro do app ou `local-llm update` no terminal.
 
 ---
 
+## 0.9.1 — 21/08/2026
+
+**Novo — `local-llm bot --help` explica o protocolo inteiro**
+
+Imprime a especificação completa do modo bot: cada tipo de linha que sai, o
+formato da linha que entra, o significado de cada campo, um exemplo em Python
+que funciona, e as duas pegadinhas que custam tempo (onde rodar o bot, e por
+que mandar-e-sair precisa esperar).
+
+O texto é o mesmo de `docs/BOT.md`, **embutido no binário**. Isso é o ponto:
+documentação que um agente é mandado ler costuma descrever outra versão que não
+a instalada. Assim o programa responde por si mesmo — para integrar alguém,
+entregue o comando em vez de um link.
+
+Um teste garante que todo tipo de linha que o bot sabe emitir aparece no guia.
+Um evento novo sem uma palavra na documentação para a compilação dos testes, em
+vez de aparecer como um `type` desconhecido do outro lado semanas depois.
+
 ## 0.9.0 — 21/08/2026
 
 **Novo — `local-llm bot`, a sala sem interface**

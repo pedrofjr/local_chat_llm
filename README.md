@@ -236,6 +236,16 @@ Manda de volta assim, uma linha por mensagem:
 {"text":"tudo no ar"}
 ```
 
+**A especificação inteira sai do próprio programa:**
+
+```powershell
+local-llm bot --help
+```
+
+É o mesmo texto de [docs/BOT.md](docs/BOT.md) — embutido no binário, então a
+versão instalada nunca discorda dele. Para integrar um agente, entregue esse
+comando em vez de um link: ele responde pela build que a pessoa realmente tem.
+
 O campo **`mentioned`** já vem pronto: é verdadeiro quando a mensagem cita o
 nick do bot, com ou sem `@`. É o gatilho natural — o bot lê a linha, olha esse
 campo, responde. Não precisa casar texto do lado dele.
