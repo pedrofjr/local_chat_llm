@@ -60,7 +60,7 @@ Teclas:
 | `Ctrl+H` | borra a escolhida **só na sua tela** (ou clique no `▨ hide`) |
 | `Ctrl+G` | abre a imagem da escolhida; de novo, ocupa a janela (`Esc` volta) |
 | `Ctrl+Shift+V` | manda a imagem da área de transferência |
-| `Tab` | completa o nome no `/w` |
+| `Tab` | completa o nome no `/w`, ou depois de um `@` |
 | `F12` | disfarce: nomes viram papéis de modelo, avisos e o rascunho somem |
 | `PgUp` / `PgDn` | rola o histórico — a roda do mouse também rola |
 | `Ctrl+End` | volta pra mensagem mais nova |
@@ -217,6 +217,60 @@ dentro e são muito diferentes por fora: histórico atrasado ninguém percebe,
 imagem atrasada é alguém olhando pra tela. E todo endereço tem prazo — uma
 máquina que saiu da rede deixa um endereço lembrado que ninguém atende, e sem
 prazo ele custava **30 segundos** antes de qualquer pixel ser pedido.
+
+## Um bot na sala
+
+`local-llm bot --room <PIN> --nick Godfrey` entra na sala **sem interface**: uma
+linha JSON no stdout para cada coisa que ele ouve, uma linha JSON no stdin para
+cada coisa que ele diz.
+
+```
+{"type":"ready","room":"session","nick":"Godfrey","author":"6712…","online":true}
+{"type":"message","from":"Joao","author":"cb17…","text":"@Godfrey status?",
+ "ts":1787333824,"mine":false,"mentioned":true}
+```
+
+Manda de volta assim, uma linha por mensagem:
+
+```
+{"text":"tudo no ar"}
+```
+
+O campo **`mentioned`** já vem pronto: é verdadeiro quando a mensagem cita o
+nick do bot, com ou sem `@`. É o gatilho natural — o bot lê a linha, olha esse
+campo, responde. Não precisa casar texto do lado dele.
+
+Ele também emite `{"type":"sent",…}` a cada envio e `{"type":"error",…}` quando
+a linha de entrada não é JSON válido. Uma linha que não seja JSON é **recusada**,
+não enviada: adivinhar seria mandar para a sala inteira algo que ninguém quis.
+
+**Por que não escrever no `log.bin` direto:** ele é cifrado com a chave da sala,
+cada registro é assinado com a chave do aparelho e conferido por todos os peers,
+e o arquivo é reescrito inteiro a cada gravação (ele até se compacta sozinho).
+Um programa de fora precisaria das duas chaves, do enquadramento exato e da
+numeração por autor — e um registro que erre qualquer um desses é recusado por
+todo mundo. Aqui o app faz tudo isso, e o bot só lida com texto.
+
+**Onde rodar importa.** O bot é sempre um participante próprio, com chave e nome
+dele. O que muda é como ele é encontrado:
+
+- **Na mesma máquina de alguém:** rode **sem** `LOCAL_LLM_HOME`. Ele vira a
+  instância 2 e os dois se acham pelo arquivo de presença que compartilham. O
+  mDNS não enxerga dois processos da mesma máquina, então esse arquivo é o único
+  caminho — e apontar o bot para outro `LOCAL_LLM_HOME` o coloca onde o chat
+  nunca olha: os dois ficam na mesma sala sem nunca se ver.
+- **Em máquina própria:** vale qualquer coisa, `LOCAL_LLM_HOME` inclusive.
+
+Mandar uma notificação e sair funciona:
+
+```powershell
+'{"text":"deploy terminou"}' | local-llm bot --room 7K2M-9QXP --nick CI
+```
+
+O processo espera alguém aparecer para entregar antes de encerrar (até 12s), e
+avisa se ninguém apareceu. Sem isso a mensagem se perderia: ela vai pelo gossip,
+para os vizinhos que existem **naquele instante**, e um processo que subiu há um
+segundo ainda não tem nenhum.
 
 ## Esconder uma mensagem
 

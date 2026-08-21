@@ -12,6 +12,50 @@ Para atualizar, `/update` dentro do app ou `local-llm update` no terminal.
 
 ---
 
+## 0.9.0 — 21/08/2026
+
+**Novo — `local-llm bot`, a sala sem interface**
+
+```
+local-llm bot --room 7K2M-9QXP --nick Godfrey
+```
+
+Entra na sala e vira dois canos: uma linha JSON no stdout para cada coisa que
+ouve, uma linha JSON no stdin para cada coisa que diz. Serve para um programa
+participar da conversa em qualquer linguagem, sem interface e sem tocar em
+criptografia.
+
+```
+{"type":"message","from":"Joao","text":"@Godfrey status?","mentioned":true,…}
+{"text":"tudo no ar"}
+```
+
+O campo **`mentioned`** já vem resolvido — verdadeiro quando a mensagem cita o
+nick do bot, com ou sem `@`. É o gatilho, e casa com a menção que a 0.8.0
+trouxe: o colega escreve `@Godfrey`, o bot recebe a linha já marcada.
+
+Detalhes que valem saber:
+
+- Uma linha de entrada que não seja JSON válido é **recusada**, com
+  `{"type":"error",…}`. Adivinhar seria mandar para a sala inteira algo que
+  ninguém quis dizer.
+- O bot é um participante próprio, com chave e nome dele — não fala pela
+  identidade de ninguém.
+- **Na mesma máquina de alguém, rode sem `LOCAL_LLM_HOME`.** Os dois se acham
+  pelo arquivo de presença que compartilham; o mDNS não enxerga dois processos
+  da mesma máquina. Apontar o bot para outra pasta o põe onde o chat nunca
+  olha, e os dois ficam na mesma sala sem nunca se ver.
+- Mandar uma notificação e sair funciona: o processo espera alguém aparecer
+  para entregar (até 12s) e avisa se ninguém apareceu. Sem isso a mensagem se
+  perdia — ela vai pelos vizinhos que existem **naquele instante**, e um
+  processo que subiu há um segundo ainda não tem nenhum.
+
+Por que não escrever no `log.bin` direto, já que a pergunta apareceu: ele é
+cifrado com a chave da sala, cada registro é assinado com a chave do aparelho
+e conferido por todos, e o arquivo é reescrito inteiro a cada gravação. Um
+programa de fora precisaria das duas chaves, do enquadramento exato e da
+numeração por autor — e errar qualquer um faz todo mundo recusar o registro.
+
 ## 0.8.0 — 21/08/2026
 
 **Novo — menção com `@`**

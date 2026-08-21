@@ -1,3 +1,4 @@
+mod bot;
 mod crypto;
 mod media;
 mod net;
@@ -18,6 +19,10 @@ local-llm
   local-llm            open the chat
   local-llm update     install a new build and exit
   local-llm version    print the version
+
+  local-llm bot --room <PIN> [--nick <name>]
+                       join a room as a program: one json object per line
+                       out, one json object per line in
 ";
 
 fn main() -> anyhow::Result<()> {
@@ -34,6 +39,21 @@ fn main() -> anyhow::Result<()> {
     match args.first().map(String::as_str) {
         None => rt.block_on(tui::run()),
         Some("update") => rt.block_on(update::run_cli()),
+        Some("bot") => {
+            let flag = |name: &str| -> Option<String> {
+                let at = args.iter().position(|a| a == name)?;
+                args.get(at + 1).cloned()
+            };
+            match flag("--room").or_else(|| flag("--pin")) {
+                Some(pin) => rt.block_on(bot::run(&pin, flag("--nick").as_deref())),
+                None => {
+                    eprintln!("local-llm bot: --room <PIN> is required
+");
+                    eprint!("{USAGE}");
+                    std::process::exit(2);
+                }
+            }
+        }
         Some("version" | "--version" | "-V") => {
             println!("local-llm {}", env!("CARGO_PKG_VERSION"));
             Ok(())

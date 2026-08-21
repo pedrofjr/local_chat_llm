@@ -3179,7 +3179,7 @@ fn mention_spans(
     spans
 }
 
-fn mentions(text: &str, nick: &str) -> bool {
+pub fn mentions(text: &str, nick: &str) -> bool {
     if nick.is_empty() {
         return false;
     }
