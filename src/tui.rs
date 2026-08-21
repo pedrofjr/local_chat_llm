@@ -303,6 +303,10 @@ pub struct App {
     shots: HashMap<[u8; 32], Shot>,
     /// How this terminal draws. Settled once at startup, never re-queried.
     proto: ImageProto,
+    /// The picture currently filling the window, if any. A screenshot shrunk
+    /// into a feed slot is unreadable, and reading it is usually the point of
+    /// having sent it.
+    zoom: Option<Zoom>,
     /// Set by a click on the picture line, consumed by the event loop.
     pending_expand: Option<usize>,
     /// Who the next message goes to privately. Set by `/w` and held until
@@ -350,6 +354,20 @@ impl Shot {
     }
 }
 
+/// One picture filling the window, over the conversation.
+///
+/// Its own `Shot` rather than the one in `app.shots`: those are encoded for a
+/// slot in the feed, and pixels are encoded for the exact area they will be
+/// drawn into. The same picture at two sizes is two encodes -- at 78 ms each,
+/// cheap enough to keep both rather than re-encode on every toggle.
+struct Zoom {
+    /// Which message, so closing can put the selection back where it was.
+    key: ([u8; 32], u64),
+    /// Kept so the picture can be re-encoded when the window is resized.
+    img: Box<ImageRef>,
+    shot: Shot,
+}
+
 /// Advances every visible animation whose frame is due.
 ///
 /// Nothing here is expensive: the frames were encoded when the picture was
@@ -362,21 +380,35 @@ fn tick_animations(app: &mut App) {
         return;
     }
     let now = Instant::now();
+    // A zoomed picture is the only thing on screen, and its frames live
+    // outside `shots`, so it advances on its own.
+    if let Some(zoom) = &mut app.zoom {
+        advance(&mut zoom.shot, now);
+        return;
+    }
     let on_screen = std::mem::take(&mut app.on_screen);
     for (blob, shot) in app.shots.iter_mut() {
         if !shot.animated() || !on_screen.contains(blob) {
             continue;
         }
-        let Some(due) = shot.next else { continue };
-        if due <= now {
-            shot.at = (shot.at + 1) % shot.frames.len();
-            let delay = shot.delays.get(shot.at).copied().unwrap_or(100).max(20);
-            // From `now` rather than from `due`: a frame that came late must
-            // not make the next one land immediately and cascade.
-            shot.next = Some(now + Duration::from_millis(u64::from(delay)));
-        }
+        advance(shot, now);
     }
     app.on_screen = on_screen;
+}
+
+/// Moves one animation to its next frame if that frame is due.
+fn advance(shot: &mut Shot, now: Instant) {
+    if !shot.animated() {
+        return;
+    }
+    let Some(due) = shot.next else { return };
+    if due <= now {
+        shot.at = (shot.at + 1) % shot.frames.len();
+        let delay = shot.delays.get(shot.at).copied().unwrap_or(100).max(20);
+        // From `now` rather than from `due`: a frame that came late must not
+        // make the next one land immediately and cascade.
+        shot.next = Some(now + Duration::from_millis(u64::from(delay)));
+    }
 }
 
 /// When the next frame of anything currently on screen is due. `None` means
@@ -384,6 +416,9 @@ fn tick_animations(app: &mut App) {
 fn next_frame_due(app: &App) -> Option<Instant> {
     if app.masked {
         return None;
+    }
+    if let Some(zoom) = &app.zoom {
+        return zoom.shot.animated().then_some(zoom.shot.next).flatten();
     }
     app.shots
         .iter()
@@ -448,6 +483,7 @@ impl App {
             expanded_rev: 0,
             shots: HashMap::new(),
             proto,
+            zoom: None,
             pending_expand: None,
             on_screen: Vec::new(),
             whispering: None,
@@ -517,6 +553,7 @@ impl App {
         self.expanded.clear();
         self.expanded_rev += 1;
         self.shots.clear();
+        self.zoom = None;
         self.on_screen.clear();
         self.unread = 0;
         self.follow = true;
@@ -716,34 +753,56 @@ fn settle_image_proto() {
     std::thread::Builder::new()
         .name("proto-query".into())
         .spawn(move || {
+            // The same query answers both questions, so take both. Keeping
+            // only the protocol and re-guessing the cell was drawing every
+            // sixel at the wrong scale on any terminal whose font is not
+            // 10x20 -- which is most of them.
             let found = match Picker::from_query_stdio() {
-                Ok(picker) if picker.protocol_type() == ProtocolType::Sixel => ImageProto::Sixel,
-                // Kitty and iTerm2 do not exist on Windows, and we would not
-                // know what to do with them here anyway.
-                _ => ImageProto::Halfblocks,
+                Ok(picker) => {
+                    let size = picker.font_size();
+                    // Kitty and iTerm2 do not exist on Windows, and we would
+                    // not know what to do with them here anyway.
+                    let proto = if picker.protocol_type() == ProtocolType::Sixel {
+                        ImageProto::Sixel
+                    } else {
+                        ImageProto::Halfblocks
+                    };
+                    (proto, size.width, size.height)
+                }
+                Err(_) => (ImageProto::Halfblocks, 0, 0),
             };
             let _ = tx.send(found);
         })
         .ok();
-    settings.image_proto = rx
+    let (proto, cell_w, cell_h) = rx
         .recv_timeout(PROTO_QUERY_WAIT)
-        .unwrap_or(ImageProto::Halfblocks);
+        .unwrap_or((ImageProto::Halfblocks, 0, 0));
+    settings.image_proto = proto;
+    settings.cell_w = cell_w;
+    settings.cell_h = cell_h;
     let _ = dir.save_settings(&settings);
 }
 
 /// Builds the picker from what we already decided, without touching stdin.
-fn picker_for(proto: ImageProto) -> Picker {
-    match proto {
-        ImageProto::Sixel => {
-            // `halfblocks()` is just "a picker with a sane assumed cell size"
-            // -- 10x20, the same numbers CELL_W/CELL_H lay out against -- and
-            // unlike the querying constructors it never touches stdin.
-            let mut picker = Picker::halfblocks();
-            picker.set_protocol_type(ProtocolType::Sixel);
-            picker
-        }
-        _ => Picker::halfblocks(),
+///
+/// `cell` is what the terminal said one character occupies. Sixel puts real
+/// pixels inside an area measured in cells, so this number is the conversion
+/// between the two and getting it wrong scales the whole picture.
+fn picker_for(proto: ImageProto, cell: (u16, u16)) -> Picker {
+    // Deprecated in favour of `from_query_stdio` or `halfblocks`, and neither
+    // can do this job: the first reads stdin, which is the one thing we may
+    // not do once the input thread is running, and the second throws the
+    // measured cell away and asserts 10x20. This is the only constructor that
+    // takes a cell size we already know. The protocol guess it makes from env
+    // vars is overwritten on the next line.
+    #[allow(deprecated)]
+    let mut picker = Picker::from_fontsize(cell.into());
+    if proto == ImageProto::Sixel {
+        picker.set_protocol_type(ProtocolType::Sixel);
+    } else {
+        picker.set_protocol_type(ProtocolType::Halfblocks);
     }
+    picker
 }
 
 /// Reads the terminal, tagging each event with whether it arrived as part of a
@@ -849,6 +908,9 @@ async fn run_inner(terminal: &mut Term) -> Result<()> {
     loop {
         // Frames advance before the draw, so what is painted is what is due.
         tick_animations(&mut app);
+        // Pixels do not reflow: a window resized under a zoomed picture needs
+        // it encoded again, at the size it is now.
+        refit_zoom(&mut app).await;
         terminal.draw(|f| draw(f, &mut app))?;
         // Asked *after* drawing: the draw is what establishes which pictures
         // are actually on screen, and asking before it would miss the frame
@@ -1276,6 +1338,87 @@ async fn toggle_hidden(app: &mut App, idx: usize) {
 
 /// Opens or closes the picture on message `idx`.
 ///
+/// Whether the picture on that message is already expanded in the feed.
+fn already_open(app: &App, idx: usize) -> bool {
+    matches!(
+        app.feed.get(idx),
+        Some(Feed::Msg { author, seq, image: Some(_), .. })
+            if app.expanded.contains(&(*author, *seq))
+    )
+}
+
+/// Fills the window with one picture.
+///
+/// The feed deliberately keeps pictures small so a screenshot cannot bury the
+/// conversation it belongs to. That trade is right for reading the room and
+/// wrong for reading the screenshot, so this is the other half of it: the feed
+/// stays a feed, and looking properly is one keypress away.
+async fn open_zoom(app: &mut App, idx: usize) {
+    let Some(Feed::Msg {
+        author,
+        seq,
+        image: Some(img),
+        ..
+    }) = app.feed.get(idx)
+    else {
+        app.status = "that message has no picture".into();
+        return;
+    };
+    let (key, img) = ((*author, *seq), (**img).clone());
+    if app.masked {
+        app.status = "not while the disguise is on".into();
+        return;
+    }
+    let area = app.chat_area;
+    match build_shot_within(app, &img, area.width, area.height).await {
+        Ok(shot) => {
+            app.status = "esc closes the picture".into();
+            app.zoom = Some(Zoom {
+                key,
+                img: Box::new(img),
+                shot,
+            });
+        }
+        Err(why) => app.status = why,
+    }
+}
+
+/// Drops the full-window picture. Returns whether there was one, so Esc can
+/// treat it as the first thing it unwinds.
+fn close_zoom(app: &mut App) -> bool {
+    let had = app.zoom.take().is_some();
+    if had {
+        app.status = "picture closed".into();
+    }
+    had
+}
+
+/// Re-encodes the zoomed picture after the window changed size. The frames
+/// were encoded for the old area, and pixels do not reflow the way text does.
+async fn refit_zoom(app: &mut App) {
+    let Some(zoom) = &app.zoom else { return };
+    let area = app.chat_area;
+    if zoom.shot.for_area == ratatui::layout::Size::new(area.width, area.height) {
+        return;
+    }
+    let (key, img) = (zoom.key, (*zoom.img).clone());
+    match build_shot_within(app, &img, area.width, area.height).await {
+        Ok(shot) => {
+            app.zoom = Some(Zoom {
+                key,
+                img: Box::new(img),
+                shot,
+            });
+        }
+        // A window too small to hold it at all is a closed picture, not a
+        // stale one drawn at the wrong size over the conversation.
+        Err(why) => {
+            app.zoom = None;
+            app.status = why;
+        }
+    }
+}
+
 /// Closing throws the decoded frames away rather than keeping them warm: a
 /// closed picture must not be sitting in memory ready to paint, and a room
 /// scrolled through end to end would otherwise hold every screenshot ever sent.
@@ -1326,6 +1469,23 @@ async fn toggle_expanded(app: &mut App, idx: usize) {
 /// drawn. The encoding is the expensive half, so it happens here -- once, on a
 /// deliberate keypress -- and not while drawing frames.
 async fn build_shot(app: &App, img: &ImageRef) -> Result<Shot, String> {
+    let width = app.chat_area.width;
+    let max_cols = if width <= 34 {
+        width.saturating_sub(4)
+    } else {
+        (width * 7) / 10
+    };
+    build_shot_within(app, img, max_cols, IMAGE_MAX_ROWS).await
+}
+
+/// The same, told exactly how much room it may use. Zoom hands it the whole
+/// window; the feed hands it a slot.
+async fn build_shot_within(
+    app: &App,
+    img: &ImageRef,
+    max_cols: u16,
+    max_rows: u16,
+) -> Result<Shot, String> {
     let Some(room) = &app.room else {
         return Err("no room open".into());
     };
@@ -1334,20 +1494,15 @@ async fn build_shot(app: &App, img: &ImageRef) -> Result<Shot, String> {
         return Err("waiting for the pixels to arrive…".into());
     };
 
-    let width = app.chat_area.width;
-    let max_cols = if width <= 34 {
-        width.saturating_sub(4)
-    } else {
-        (width * 7) / 10
-    };
-    let (cols, rows) = fit_cells(img.w, img.h, max_cols, IMAGE_MAX_ROWS);
+    let cell = Cell::from(app.settings.cell());
+    let (cols, rows) = fit_cells(img.w, img.h, max_cols, max_rows, cell);
     if cols == 0 || rows == 0 {
         return Err("terminal too small for that picture".into());
     }
 
     let frames = crate::media::frames(&bytes, img.kind, MAX_GIF_FRAMES)
         .map_err(|e| format!("cannot read that picture: {e}"))?;
-    let picker = picker_for(app.proto);
+    let picker = picker_for(app.proto, app.settings.cell());
     let area = ratatui::layout::Size::new(cols, rows);
     let mut encoded = Vec::with_capacity(frames.len());
     let mut delays = Vec::with_capacity(frames.len());
@@ -1508,6 +1663,12 @@ async fn wipe(app: &mut App, alias: &str, topic: &[u8; 32]) -> Result<()> {
 fn toggle_mask(app: &mut App) {
     app.masked = !app.masked;
     if app.masked {
+        // The disguise exists to make one keypress clear the screen of
+        // anything that reads as a chat. A screenshot filling the window is
+        // the most obvious thing there is, so it goes first and does not come
+        // back when the disguise lifts -- F12 is not a way to hide a picture
+        // for a moment.
+        app.zoom = None;
         app.mask_stash = std::mem::take(&mut app.input.text);
         app.input.cursor = 0;
     } else {
@@ -1635,7 +1796,12 @@ async fn handle_chat<B: Backend>(
             // the whisper the prompt is pointed at. Leaving the whisper for
             // last means a half-typed private line is never sent to the room
             // by one keystroke too many -- clearing it comes first.
-            if app.replying.is_some() {
+            //
+            // A picture filling the window comes before all of it: while it is
+            // up nothing else is visible, so Esc can only sensibly mean "put
+            // the conversation back".
+            if close_zoom(app) {
+            } else if app.replying.is_some() {
                 app.replying = None;
                 app.picked = None;
                 app.status = CHAT_HINT.into();
@@ -1664,8 +1830,18 @@ async fn handle_chat<B: Backend>(
             Some(idx) => copy_message(app, idx),
             None => app.status = "alt+up picks a message to copy".into(),
         },
+        // Progressive on purpose: the first press opens the picture where it
+        // sits, the second fills the window with it. Nobody has to know about
+        // a second key, and the small step comes first -- which is the one
+        // that keeps the screen looking like a log.
         KeyCode::Char('g') if is_shortcut(&key) => match app.picked.or(app.hover) {
-            Some(idx) => toggle_expanded(app, idx).await,
+            Some(idx) => {
+                if already_open(app, idx) {
+                    open_zoom(app, idx).await;
+                } else {
+                    toggle_expanded(app, idx).await;
+                }
+            }
             None => app.status = "alt+up picks a picture to open".into(),
         },
         // Ctrl+Shift+V always means "paste the picture", because Ctrl+V may
@@ -1959,6 +2135,7 @@ async fn image_cmd(app: &mut App, line: &str) {
         app.proto = chosen;
         // Anything already encoded was drawn the old way.
         app.shots.clear();
+        app.zoom = None;
         app.expanded.clear();
         app.expanded_rev += 1;
         app.status = match chosen {
@@ -2396,6 +2573,10 @@ fn draw(f: &mut Frame, app: &mut App) {
     match app.screen.clone() {
         Screen::Home => draw_home(f, chunks[1], app),
         Screen::Unlock { alias, .. } => draw_unlock(f, chunks[1], &alias),
+        // A zoomed picture takes the conversation's place rather than sitting
+        // over it: half a chat behind a screenshot reads as a glitch, and the
+        // disguise is cleaner with one thing on screen at a time.
+        Screen::Chat if app.zoom.is_some() && !app.masked => draw_zoom(f, chunks[1], app),
         Screen::Chat => draw_chat(f, chunks[1], app),
         Screen::Help => draw_help(f, chunks[1]),
         Screen::Confirm { alias, .. } => draw_confirm(f, chunks[1], &alias),
@@ -2507,7 +2688,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         ("ctrl+r", "answer it"),
         ("ctrl+y", "copy it"),
         ("ctrl+h", "blur it here"),
-        ("ctrl+g", "open a picture"),
+        ("ctrl+g", "open a picture, again to fill"),
         ("ctrl+shift+v", "paste a picture"),
         ("pgup / pgdn", "scroll (wheel too)"),
         ("ctrl+end", "jump to the newest"),
@@ -2715,6 +2896,28 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
         painted.push(slot.blob);
     }
     app.on_screen = painted;
+}
+
+/// Paints one picture over the whole conversation area, centred.
+fn draw_zoom(f: &mut Frame, area: Rect, app: &mut App) {
+    app.chat_area = area;
+    let Some(zoom) = &app.zoom else { return };
+    let Some(proto) = zoom.shot.frames.get(zoom.shot.at) else {
+        return;
+    };
+    let size = zoom.shot.for_area;
+    // Centred, and never at a negative offset: an area smaller than the
+    // picture is drawn from the corner rather than pushed off the top left.
+    let x = area.width.saturating_sub(size.width) / 2;
+    let y = area.height.saturating_sub(size.height) / 2;
+    let buf = f.buffer_mut();
+    let position = SignedPosition {
+        x: i16::try_from(x).unwrap_or(0),
+        y: i16::try_from(y).unwrap_or(0),
+    };
+    SlicedImage::new(proto, position).render(area, buf);
+    // The picture is on screen, so its animation clock has to keep running.
+    app.on_screen = vec![zoom.img.blob];
 }
 
 /// True when `nick` appears in `text` as a whole word, with or without a
@@ -3006,28 +3209,53 @@ const IMAGE_MAX_ROWS: u16 = 20;
 const CELL_W: u32 = 10;
 const CELL_H: u32 = 20;
 
+/// A cell as `(width, height)` in pixels, for the layout arithmetic below.
+#[derive(Clone, Copy)]
+struct Cell {
+    w: u32,
+    h: u32,
+}
+
+impl Cell {
+    fn from(measured: (u16, u16)) -> Self {
+        Self {
+            w: u32::from(measured.0).max(1),
+            h: u32::from(measured.1).max(1),
+        }
+    }
+}
+
+impl Default for Cell {
+    fn default() -> Self {
+        Self {
+            w: CELL_W,
+            h: CELL_H,
+        }
+    }
+}
+
 /// How many cells a `w`x`h` picture wants, kept inside the given bounds and
 /// keeping its shape.
-fn fit_cells(w: u32, h: u32, max_cols: u16, max_rows: u16) -> (u16, u16) {
+fn fit_cells(w: u32, h: u32, max_cols: u16, max_rows: u16, cell: Cell) -> (u16, u16) {
     if w == 0 || h == 0 || max_cols == 0 || max_rows == 0 {
         return (0, 0);
     }
     // Never blow a small picture up: a 48x48 sticker stretched across the
     // window is worse than a small one.
-    let natural_cols = (w / CELL_W).max(1) as u16;
+    let natural_cols = (w / cell.w).max(1) as u16;
     let mut cols = natural_cols.min(max_cols);
-    let mut rows = cells_tall(w, h, cols);
+    let mut rows = cells_tall(w, h, cols, cell);
     if rows > max_rows {
         // Too tall: fix the height and work the width back out.
         rows = max_rows;
-        cols = ((u32::from(rows) * CELL_H * w) / (h * CELL_W)).max(1) as u16;
+        cols = ((u32::from(rows) * cell.h * w) / (h * cell.w)).max(1) as u16;
         cols = cols.min(max_cols);
     }
     (cols.max(1), rows.max(1))
 }
 
-fn cells_tall(w: u32, h: u32, cols: u16) -> u16 {
-    ((u32::from(cols) * CELL_W * h) / (w * CELL_H)).max(1) as u16
+fn cells_tall(w: u32, h: u32, cols: u16, cell: Cell) -> u16 {
+    ((u32::from(cols) * cell.w * h) / (w * cell.h)).max(1) as u16
 }
 
 fn human_bytes(n: u32) -> String {
@@ -3802,7 +4030,7 @@ mod tests {
     /// through the same picker the app uses, so the test exercises the actual
     /// encode path rather than a stand-in.
     fn animated_shot(n: usize) -> Shot {
-        let picker = picker_for(ImageProto::Halfblocks);
+        let picker = picker_for(ImageProto::Halfblocks, (10, 20));
         let area = ratatui::layout::Size::new(8, 4);
         let frames: Vec<SlicedProtocol> = (0..n)
             .map(|i| {
@@ -3868,6 +4096,119 @@ mod tests {
         assert_eq!(h.app.shots[&blob].at, before, "and must not advance either");
     }
 
+    /// A picture filling the window is the single most chat-looking thing the
+    /// app can put on screen, so the disguise has to take it down -- and take
+    /// it down for good, not park it behind the mask waiting to reappear.
+    #[tokio::test]
+    async fn the_disguise_takes_a_full_window_picture_down_for_good() {
+        let mut h = Harness::new();
+        h.cmd("/new sala").await;
+        h.app.zoom = Some(Zoom {
+            key: ([1u8; 32], 1),
+            img: Box::new(a_picture([0x5a; 32])),
+            shot: animated_shot(3),
+        });
+
+        toggle_mask(&mut h.app);
+        assert!(h.app.masked);
+        assert!(h.app.zoom.is_none(), "F12 must clear the picture");
+
+        toggle_mask(&mut h.app);
+        assert!(!h.app.masked);
+        assert!(
+            h.app.zoom.is_none(),
+            "and lifting the disguise must not bring it back"
+        );
+    }
+
+    /// Esc unwinds one thing at a time, and the picture is the outermost of
+    /// them: while it is up, nothing else is even visible to unwind.
+    #[tokio::test]
+    async fn esc_puts_the_conversation_back_before_anything_else() {
+        let mut h = Harness::new();
+        h.cmd("/new sala").await;
+        send(&mut h.app, "primeira".into()).await;
+
+        let alt_up = KeyEvent::new(KeyCode::Up, KeyModifiers::ALT);
+        handle_key(&mut h.app, alt_up, &mut h.term, false).await.unwrap();
+        let ctrl_r = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL);
+        handle_key(&mut h.app, ctrl_r, &mut h.term, false).await.unwrap();
+        assert!(h.app.replying.is_some());
+
+        h.app.zoom = Some(Zoom {
+            key: ([1u8; 32], 1),
+            img: Box::new(a_picture([0x5a; 32])),
+            shot: animated_shot(2),
+        });
+
+        h.press(KeyCode::Esc).await;
+        assert!(h.app.zoom.is_none(), "the picture goes first");
+        assert!(
+            h.app.replying.is_some(),
+            "and the armed reply survives that press"
+        );
+
+        h.press(KeyCode::Esc).await;
+        assert!(h.app.replying.is_none(), "the next press gets the reply");
+    }
+
+    /// The zoomed picture keeps its own frames, outside `shots`, so the clock
+    /// has to know about it or a gif opened full-window sits on frame one.
+    #[tokio::test]
+    async fn a_gif_keeps_moving_when_it_fills_the_window() {
+        let mut h = Harness::new();
+        h.cmd("/new sala").await;
+        h.app.zoom = Some(Zoom {
+            key: ([1u8; 32], 1),
+            img: Box::new(a_picture([0x5a; 32])),
+            shot: animated_shot(3),
+        });
+
+        assert!(
+            next_frame_due(&h.app).is_some(),
+            "a zoomed animation has to keep asking to be woken"
+        );
+        tick_animations(&mut h.app);
+        assert_eq!(
+            h.app.zoom.as_ref().unwrap().shot.at,
+            1,
+            "a due frame should advance"
+        );
+    }
+
+    /// Ctrl+G is one key doing two things in order: open where it sits, then
+    /// fill the window. The order matters -- the small step is the one that
+    /// keeps the screen looking like a log.
+    #[tokio::test]
+    async fn the_second_press_is_what_fills_the_window() {
+        let mut h = Harness::new();
+        h.cmd("/new sala").await;
+        send(&mut h.app, "olha isso".into()).await;
+        let idx = h.app.feed.len() - 1;
+        let Some(Feed::Msg { author, seq, image, .. }) = h.app.feed.get_mut(idx) else {
+            panic!("expected a message");
+        };
+        *image = Some(Box::new(a_picture([0x5a; 32])));
+        let key = (*author, *seq);
+
+        assert!(!already_open(&h.app, idx), "closed to begin with");
+        h.app.expanded.insert(key);
+        assert!(
+            already_open(&h.app, idx),
+            "an expanded picture is what the second press acts on"
+        );
+    }
+
+    fn a_picture(blob: [u8; 32]) -> ImageRef {
+        ImageRef {
+            blob,
+            w: 320,
+            h: 240,
+            kind: ImageKind::Png,
+            bytes: 1234,
+        }
+    }
+
     #[tokio::test]
     async fn a_late_frame_does_not_cascade_through_the_rest() {
         let mut h = Harness::new();
@@ -3912,24 +4253,61 @@ mod tests {
 
     #[test]
     fn a_picture_keeps_its_shape_inside_the_space_it_gets() {
+        let cell = Cell::default();
         // Wider than tall, plenty of room: bounded by width.
-        let (cols, rows) = fit_cells(800, 400, 40, 20);
+        let (cols, rows) = fit_cells(800, 400, 40, 20, cell);
         assert!(cols <= 40 && rows <= 20, "{cols}x{rows}");
         assert!(rows >= 1);
 
         // Tall and narrow: the height limit is what binds, and the width has
         // to come down with it or the picture stretches.
-        let (cols, rows) = fit_cells(400, 4000, 40, 20);
+        let (cols, rows) = fit_cells(400, 4000, 40, 20, cell);
         assert_eq!(rows, 20);
         assert!(cols < 40, "a tall picture must not fill the width: {cols}");
 
         // A sticker is not blown up to fill the window.
-        let (cols, _) = fit_cells(48, 48, 60, 20);
+        let (cols, _) = fit_cells(48, 48, 60, 20, cell);
         assert!(cols <= 6, "small pictures stay small, got {cols}");
 
         // Degenerate input must not panic or divide by zero.
-        assert_eq!(fit_cells(0, 0, 40, 20), (0, 0));
-        assert_eq!(fit_cells(100, 100, 0, 20), (0, 0));
+        assert_eq!(fit_cells(0, 0, 40, 20, cell), (0, 0));
+        assert_eq!(fit_cells(100, 100, 0, 20, cell), (0, 0));
+    }
+
+    /// A narrower cell means the same picture needs *more* columns to keep
+    /// its shape. Getting this backwards is what a wrong assumed cell does:
+    /// the picture is drawn into an area whose pixel size is not what the
+    /// encoder was told, and it comes out stretched or clipped.
+    #[test]
+    fn the_cell_the_terminal_reports_decides_the_shape() {
+        let square = (400, 400);
+        let wide = Cell::from((10, 20));
+        let narrow = Cell::from((6, 20));
+
+        let (wide_cols, wide_rows) = fit_cells(square.0, square.1, 200, 200, wide);
+        let (narrow_cols, narrow_rows) = fit_cells(square.0, square.1, 200, 200, narrow);
+
+        assert!(
+            narrow_cols > wide_cols,
+            "narrower cells need more of them: {narrow_cols} vs {wide_cols}"
+        );
+        // Same picture, same physical height either way -- give or take the
+        // one row that whole cells cannot express.
+        assert!(
+            (i32::from(wide_rows) - i32::from(narrow_rows)).abs() <= 1,
+            "{wide_rows} vs {narrow_rows}"
+        );
+        // And the area asked for still matches the picture's own shape.
+        for (cols, rows, cell) in [(wide_cols, wide_rows, wide), (narrow_cols, narrow_rows, narrow)]
+        {
+            let drawn_w = u32::from(cols) * cell.w;
+            let drawn_h = u32::from(rows) * cell.h;
+            let off = (drawn_w as i64 - drawn_h as i64).abs();
+            assert!(
+                off <= i64::from(cell.w) + i64::from(cell.h),
+                "a square came out {drawn_w}x{drawn_h}"
+            );
+        }
     }
 
     /// A message from somebody else, for tests that only care about layout.
@@ -5341,5 +5719,65 @@ mod tests {
         assert_eq!(input.text, "second");
         input.recall_next();
         assert_eq!(input.text, "draft");
+    }
+
+    /// What opening a picture actually costs, at the size we draw it.
+    ///
+    /// Not an assertion -- a measurement. "Slow to load" has two candidate
+    /// halves, the pixels arriving over the network and the encode that turns
+    /// them into terminal output, and guessing which one to fix is how you fix
+    /// neither.
+    ///
+    ///   $env:LOCAL_LLM_SHOT = 'C:\path\to\a.png'
+    ///   cargo test encoding_a_picture_costs -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn encoding_a_picture_costs() {
+        let Ok(path) = std::env::var("LOCAL_LLM_SHOT") else {
+            eprintln!("set LOCAL_LLM_SHOT to a picture");
+            return;
+        };
+        let raw = std::fs::read(&path).expect("read the picture");
+
+        let t = Instant::now();
+        let ready = crate::media::prepare(&raw).expect("prepare");
+        eprintln!(
+            "prepare      {:>7.1} ms   {}x{}  {} KB on the wire",
+            t.elapsed().as_secs_f64() * 1000.0,
+            ready.w,
+            ready.h,
+            ready.bytes.len() / 1024
+        );
+
+        let t = Instant::now();
+        let frames = crate::media::frames(&ready.bytes, ready.kind, MAX_GIF_FRAMES).expect("decode");
+        eprintln!(
+            "decode       {:>7.1} ms   {} frame(s)",
+            t.elapsed().as_secs_f64() * 1000.0,
+            frames.len()
+        );
+
+        // Both protocols, and heights either side of today's ceiling, because
+        // the fix under discussion is "let a picture be taller".
+        for proto in [ImageProto::Sixel, ImageProto::Halfblocks] {
+            let picker = picker_for(proto, (10, 20));
+            for max_rows in [IMAGE_MAX_ROWS, 40, 60] {
+                let (cols, rows) = fit_cells(ready.w, ready.h, 95, max_rows, Cell::default());
+                let t = Instant::now();
+                let drawn = SlicedProtocol::new_with_resize(
+                    &picker,
+                    frames[0].image.clone(),
+                    ratatui::layout::Size::new(cols, rows),
+                    ratatui_image::Resize::Fit(None),
+                );
+                eprintln!(
+                    "{proto:?} rows<={max_rows:<3} {:>7.1} ms   {cols}x{rows} cells = {}x{} px  {}",
+                    t.elapsed().as_secs_f64() * 1000.0,
+                    u32::from(cols) * CELL_W,
+                    u32::from(rows) * CELL_H,
+                    if drawn.is_ok() { "ok" } else { "FAILED" }
+                );
+            }
+        }
     }
 }

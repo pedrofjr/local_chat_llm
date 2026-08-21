@@ -12,6 +12,51 @@ Para atualizar, `/update` dentro do app ou `local-llm update` no terminal.
 
 ---
 
+## 0.7.0 — 21/08/2026
+
+Uma rodada inteira em cima da experiência com imagens, que estava ruim nas
+duas pontas: demorava para carregar e saía mal desenhada. Eram três causas
+diferentes, e nenhuma era a que parecia.
+
+**Imagem em tela cheia**
+
+- `Ctrl+G` numa imagem já aberta agora **põe ela na janela inteira**, e `Esc`
+  volta para a conversa. Print de tela não se lê espremido num canto do feed.
+- O feed continua com a imagem em tamanho modesto, de propósito: uma imagem
+  que enche a tela enterra a conversa a que ela pertence. Cada tecla faz uma
+  das duas coisas.
+- O `F12` fecha a imagem da janela junto com todo o resto, e não a traz de
+  volta quando o disfarce sai.
+- GIF continua animando em tela cheia.
+
+**A imagem saía com a escala errada**
+
+- O app pergunta ao terminal, uma vez, como ele desenha imagens. A resposta
+  vem com duas informações — o protocolo e o **tamanho de um caractere em
+  pixels** — e a segunda estava sendo jogada fora e substituída por um chute
+  de 10×20. Sixel desenha pixels de verdade dentro de uma área medida em
+  caracteres, então errar esse número deforma toda imagem. Agora a medida do
+  terminal é guardada e usada.
+
+**A demora não era o que parecia**
+
+- Não era o desenho: medido, custa **78 ms** montar um print de 1365×767 para
+  a tela. Era a espera pelos bytes.
+- Os pixels eram buscados no mesmo ciclo que sincroniza o histórico, **atrás**
+  dele, e só de 3 em 3 segundos. As duas esperas são muito diferentes por
+  fora: histórico atrasado ninguém percebe, imagem atrasada é alguém olhando
+  para a tela. Agora a busca é uma tarefa separada, que **acorda no instante
+  em que a imagem chega**.
+- E o principal: um endereço lembrado de uma máquina que saiu da rede custava
+  **30 segundos** — medido — antes de qualquer pixel ser pedido, porque a
+  tentativa de conexão não tinha prazo. Agora tem: 4 segundos, e os peers que
+  respondem deixam de esperar pelos que nunca vão responder.
+
+**Atenção**
+
+- Não exige que todos atualizem junto. O protocolo não mudou: uma 0.7.0
+  conversa e sincroniza histórico normalmente com uma 0.6.x.
+
 ## 0.6.3 — 19/08/2026
 
 **Novo**

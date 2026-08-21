@@ -31,9 +31,20 @@ pub const SYNC_ALPN: &[u8] = b"local-llm/4";
 /// batch has a 2 MB cap whose errors are swallowed, and sharing that budget is
 /// how a big picture would end up silently blocking text.
 const BLOB_CAP: usize = 4 * 1024 * 1024;
-/// Pictures pulled per sync round. Enough to catch up quickly after being
-/// away, few enough that a backlog cannot monopolise the link.
+/// Pictures pulled per round. Enough to catch up quickly after being away,
+/// few enough that a backlog cannot monopolise the link.
 const BLOBS_PER_ROUND: usize = 2;
+/// How long the blob loop waits before looking again on its own. The number
+/// only governs the *backlog*: a picture arriving now wakes the loop, so this
+/// is the pace of catching up on history, not the wait anybody watches.
+const BLOB_SWEEP: Duration = Duration::from_secs(3);
+/// Ceiling on one attempt to reach a peer.
+///
+/// A remembered address outlives the machine that had it, and `connect` on a
+/// dead one does not fail fast -- it waits. Without a bound, the peers that
+/// answer are held up by the ones that never will, and the wait lands on
+/// whoever is staring at a picture that has not arrived.
+const REACH_TIMEOUT: Duration = Duration::from_secs(4);
 /// How much disk one room may spend on pictures before the oldest are dropped.
 const ROOM_BLOB_QUOTA: u64 = 200 * 1024 * 1024;
 
@@ -330,11 +341,13 @@ impl NetSession {
             known: known.clone(),
             gossip_tx: sender.clone(),
         };
+        let wake = Arc::new(tokio::sync::Notify::new());
         tokio::spawn(gossip_loop(
             receiver,
             room.clone(),
             events.clone(),
             mesh.clone(),
+            wake.clone(),
         ));
         tokio::spawn(heartbeat_loop(mesh, room.clone()));
         tokio::spawn(sync_loop(
@@ -342,6 +355,14 @@ impl NetSession {
             room.clone(),
             events.clone(),
             known.clone(),
+            wake.clone(),
+        ));
+        tokio::spawn(blob_loop(
+            endpoint.clone(),
+            room.clone(),
+            events.clone(),
+            known.clone(),
+            wake,
         ));
         tokio::spawn(presence_loop(
             endpoint.clone(),
@@ -392,6 +413,7 @@ async fn gossip_loop(
     room: Arc<Mutex<OpenRoom>>,
     events: mpsc::UnboundedSender<NetEvent>,
     mesh: Mesh,
+    wake: Arc<tokio::sync::Notify>,
 ) {
     let mut peers: HashSet<EndpointId> = HashSet::new();
     while let Some(event) = receiver.next().await {
@@ -419,8 +441,15 @@ async fn gossip_loop(
                     let _ = events.send(NetEvent::Live { author, name });
                     continue;
                 }
+                let wants_pixels = rec.wants_blob().is_some();
                 let mut room = room.lock().await;
                 if let Ok(true) = room.ingest(rec) {
+                    // Ask for the bytes now rather than on the next sweep.
+                    // This is the whole difference between a picture that
+                    // opens when you click it and one you wait on.
+                    if wants_pixels {
+                        wake.notify_one();
+                    }
                     let _ = events.send(NetEvent::Record);
                 }
             }
@@ -442,10 +471,12 @@ async fn sync_loop(
     room: Arc<Mutex<OpenRoom>>,
     events: mpsc::UnboundedSender<NetEvent>,
     known: Arc<Mutex<Vec<EndpointAddr>>>,
+    wake: Arc<tokio::sync::Notify>,
 ) {
     let mut ticks = tokio::time::interval(Duration::from_secs(3));
     loop {
         ticks.tick().await;
+        let mut brought_records = false;
         let peers = { known.lock().await.clone() };
         if peers.is_empty() {
             continue;
@@ -467,7 +498,7 @@ async fn sync_loop(
         let mut reached = 0usize;
         for addr in peers.into_iter().filter(|a| a.id != me) {
             tried += 1;
-            if let Ok(conn) = endpoint.connect(addr, SYNC_ALPN).await {
+            if let Some(conn) = reach(&endpoint, addr).await {
                 reached += 1;
                 if let Ok((mut send, mut recv)) = conn.open_bi().await {
                     if send.write_all(&req).await.is_ok() && send.finish().is_ok() {
@@ -479,6 +510,7 @@ async fn sync_loop(
                                         continue;
                                     };
                                     if let Ok(true) = room.ingest(rec) {
+                                        brought_records = true;
                                         let _ = events.send(NetEvent::Record);
                                     }
                                 }
@@ -492,6 +524,42 @@ async fn sync_loop(
         if tried > 0 {
             let _ = events.send(NetEvent::SyncReach { tried, reached });
         }
+        // History can carry pictures too, so a round that brought records in
+        // is worth a look even if nothing arrived live.
+        if brought_records {
+            wake.notify_one();
+        }
+    }
+}
+
+/// Connects with a bound on how long a single peer may cost us.
+async fn reach(endpoint: &Endpoint, addr: EndpointAddr) -> Option<iroh::endpoint::Connection> {
+    match tokio::time::timeout(REACH_TIMEOUT, endpoint.connect(addr, SYNC_ALPN)).await {
+        Ok(Ok(conn)) => Some(conn),
+        _ => None,
+    }
+}
+
+/// Pulls picture bytes, on its own schedule.
+///
+/// Separate from `sync_loop` because of what the two waits mean to a person.
+/// History arriving a few seconds late is invisible; a picture arriving late
+/// is somebody looking at "waiting for the pixels to arrive". Sharing one loop
+/// put the pixels *behind* a full round of history sync -- every peer, one at
+/// a time -- so the visible wait was paying for the invisible one.
+///
+/// Woken the moment a record naming a blob lands, so the common case is not a
+/// wait at all.
+async fn blob_loop(
+    endpoint: Endpoint,
+    room: Arc<Mutex<OpenRoom>>,
+    events: mpsc::UnboundedSender<NetEvent>,
+    known: Arc<Mutex<Vec<EndpointAddr>>>,
+    wake: Arc<tokio::sync::Notify>,
+) {
+    loop {
+        // Either somebody nudged us, or it is time to check the backlog.
+        let _ = tokio::time::timeout(BLOB_SWEEP, wake.notified()).await;
         fetch_blobs(&endpoint, &room, &events, &known).await;
     }
 }
@@ -529,7 +597,7 @@ async fn fetch_blobs(
         // people for, since the one who sent it may already be offline.
         let peers = { known.lock().await.clone() };
         for addr in peers.into_iter().filter(|a: &EndpointAddr| a.id != me) {
-            let Ok(conn) = endpoint.connect(addr, SYNC_ALPN).await else {
+            let Some(conn) = reach(endpoint, addr).await else {
                 continue;
             };
             let mut landed = false;
@@ -970,6 +1038,138 @@ mod tests {
             "the screen has to be told it can open now"
         );
 
+        router.shutdown().await.ok();
+    }
+
+    /// Builds the same two-endpoint setup as above and hands back the pieces,
+    /// so the tests about *timing* do not each re-derive a room and a picture.
+    async fn a_picture_one_peer_holds() -> (
+        Arc<Mutex<OpenRoom>>,
+        [u8; 32],
+        Endpoint,
+        Arc<Mutex<Vec<EndpointAddr>>>,
+        Router,
+        TempDir,
+        TempDir,
+    ) {
+        let pin = Pin::parse("7K2M-9QXP").unwrap();
+        let (ta, tb) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let open = |tmp: &TempDir| {
+            let dir = DataDir::from_path(tmp.path().to_path_buf()).unwrap();
+            OpenRoom::join(&dir, pin.clone(), Some("sala")).unwrap()
+        };
+        let (mut giver, taker) = (open(&ta), open(&tb));
+
+        let pixels = vec![0x5au8; 20_000];
+        let rec = giver
+            .compose_image(
+                &pixels,
+                320,
+                240,
+                crate::store::ImageKind::Png,
+                String::new(),
+                None,
+            )
+            .unwrap();
+        let Record::Image { blob, .. } = &rec else {
+            panic!("expected a picture");
+        };
+        let blob = *blob;
+
+        let taker = Arc::new(Mutex::new(taker));
+        taker.lock().await.ingest(rec).unwrap();
+
+        let serving = local_endpoint().await;
+        let router = Router::builder(serving.clone())
+            .accept(
+                SYNC_ALPN,
+                SyncState {
+                    room: Arc::new(Mutex::new(giver)),
+                },
+            )
+            .spawn();
+        let mut serving_addr = serving.addr();
+        serving_addr.addrs.insert(TransportAddr::Ip(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            serving.bound_sockets()[0].port(),
+        )));
+
+        let asking = local_endpoint().await;
+        let known = Arc::new(Mutex::new(vec![serving_addr]));
+        (taker, blob, asking, known, router, ta, tb)
+    }
+
+    /// A remembered address whose machine is gone must not decide how long
+    /// everybody else waits.
+    ///
+    /// This is not hypothetical: rooms remember peers across sessions, and a
+    /// colleague who changed network leaves an address that answers nothing.
+    /// Before the bound, `connect` on that address ran to its own leisurely
+    /// conclusion while the picture sat unfetched behind it.
+    #[tokio::test]
+    async fn a_peer_that_never_answers_cannot_stall_the_pixels() {
+        let (taker, blob, asking, known, router, _ta, _tb) = a_picture_one_peer_holds().await;
+
+        // TEST-NET-1: routable nowhere, by standard. Put first in the list so
+        // the good peer is strictly behind it.
+        let dead = EndpointAddr {
+            id: SecretKey::generate().public(),
+            addrs: [TransportAddr::Ip("192.0.2.1:9".parse().unwrap())]
+                .into_iter()
+                .collect(),
+        };
+        known.lock().await.insert(0, dead);
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let started = std::time::Instant::now();
+        fetch_blobs(&asking, &taker, &tx, &known).await;
+        let took = started.elapsed();
+
+        assert!(
+            taker.lock().await.log.has_blob(&blob),
+            "the live peer still had to deliver"
+        );
+        // An absolute number on purpose. Phrasing this against REACH_TIMEOUT
+        // would mean raising the constant also raises the bar the test holds
+        // it to -- the check would follow the bug instead of catching it.
+        // Measured: bounded costs about 4s here, unbounded about 26s.
+        assert!(
+            took < Duration::from_secs(15),
+            "one unreachable peer cost {took:?}; it is supposed to be given up on"
+        );
+
+        router.shutdown().await.ok();
+    }
+
+    /// The pixels must start moving when the picture lands, not on the next
+    /// sweep. The difference is what somebody sees after clicking: a picture,
+    /// or the words "waiting for the pixels to arrive".
+    #[tokio::test]
+    async fn a_picture_landing_wakes_the_fetch() {
+        let (taker, blob, asking, known, router, _ta, _tb) = a_picture_one_peer_holds().await;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        let wake = Arc::new(tokio::sync::Notify::new());
+        let loops = tokio::spawn(blob_loop(
+            asking,
+            taker.clone(),
+            tx,
+            known,
+            wake.clone(),
+        ));
+
+        // What gossip_loop does the instant a record naming a blob arrives.
+        wake.notify_one();
+
+        // Comfortably inside the sweep: if the nudge did nothing, the first
+        // look would not happen until BLOB_SWEEP had passed.
+        let waited = tokio::time::timeout(BLOB_SWEEP / 2, rx.recv())
+            .await
+            .expect("the fetch should have started on the nudge, not on the timer");
+        assert!(matches!(waited, Some(NetEvent::Blob)));
+        assert!(taker.lock().await.log.has_blob(&blob));
+
+        loops.abort();
         router.shutdown().await.ok();
     }
 

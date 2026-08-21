@@ -58,7 +58,7 @@ Teclas:
 | `Ctrl+R` | responde a escolhida (ou clique no `↩ reply` que aparece no hover) |
 | `Ctrl+Y` | copia a escolhida (ou clique no `⧉ copy`) |
 | `Ctrl+H` | borra a escolhida **só na sua tela** (ou clique no `▨ hide`) |
-| `Ctrl+G` | abre/fecha a imagem da escolhida (ou clique na linha `image (+)`) |
+| `Ctrl+G` | abre a imagem da escolhida; de novo, ocupa a janela (`Esc` volta) |
 | `Ctrl+Shift+V` | manda a imagem da área de transferência |
 | `Tab` | completa o nome no `/w` |
 | `F12` | disfarce: nomes viram papéis de modelo, avisos e o rascunho somem |
@@ -169,10 +169,15 @@ A imagem **chega fechada**, como uma linha de texto:
   image (+)  1280x720  184 KB  png
 ```
 
-`Ctrl+G` — ou um clique na linha — abre. `Ctrl+G` de novo fecha. Isso não é
-economia de espaço: é o que mantém o disfarce. A tela em repouso continua
-sendo texto, e no `F12` **toda** imagem fecha, inclusive as que você tinha
-aberto, e a linha passa a ler como entrada multimodal (`image input`).
+`Ctrl+G` — ou um clique na linha — abre ali mesmo. **`Ctrl+G` de novo põe a
+imagem na janela inteira**, e `Esc` volta pra conversa. Print de tela não se
+lê espremido num canto do feed, e a conversa não se lê atrás de um print de
+tela; são duas coisas diferentes e cada tecla faz uma.
+
+Isso não é economia de espaço: é o que mantém o disfarce. A tela em repouso
+continua sendo texto, e no `F12` **toda** imagem fecha, inclusive a que está
+ocupando a janela e as que você tinha aberto, e a linha passa a ler como
+entrada multimodal (`image input`).
 
 GIF anima. Os quadros são preparados uma vez, na hora de abrir; depois disso
 animar é barato. E a animação **para** quando você fecha, quando ela rola pra
@@ -194,6 +199,13 @@ descrição — hash, tamanho, formato — e os bytes vêm depois, por uma conex
 própria, guardados cifrados com a chave da sala em `blobs/`. Cada sala gasta
 no máximo **200 MB** com imagens; passando disso, as mais antigas saem e a
 linha passa a dizer `image (unavailable)`.
+
+A busca dos bytes começa no instante em que a descrição chega, numa tarefa
+separada da sincronização de histórico. As duas esperas parecem iguais por
+dentro e são muito diferentes por fora: histórico atrasado ninguém percebe,
+imagem atrasada é alguém olhando pra tela. E todo endereço tem prazo — uma
+máquina que saiu da rede deixa um endereço lembrado que ninguém atende, e sem
+prazo ele custava **30 segundos** antes de qualquer pixel ser pedido.
 
 ## Esconder uma mensagem
 

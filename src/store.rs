@@ -261,6 +261,30 @@ pub struct Settings {
     /// safe before the input thread starts reading it, so we get exactly one
     /// chance per install rather than one per launch.
     pub image_proto: ImageProto,
+    /// One character cell, in pixels, as the terminal reported it during that
+    /// same detection.
+    ///
+    /// Comes free with the protocol query and matters as much: sixel draws
+    /// real pixels into an area measured in cells, so guessing the cell wrong
+    /// scales every picture wrong. Zero means "never asked" -- settings files
+    /// written by older builds have no such field, and a stored zero must not
+    /// be mistaken for a terminal with zero-width characters.
+    #[serde(default)]
+    pub cell_w: u16,
+    #[serde(default)]
+    pub cell_h: u16,
+}
+
+impl Settings {
+    /// The measured cell, or the ratio we assume when nobody has measured.
+    /// Roughly 1:2 is right for every monospace terminal font, so a picture
+    /// laid out against it comes out slightly off rather than distorted.
+    pub fn cell(&self) -> (u16, u16) {
+        match (self.cell_w, self.cell_h) {
+            (0, _) | (_, 0) => (10, 20),
+            measured => measured,
+        }
+    }
 }
 
 /// Which graphics protocol to draw with.
@@ -282,6 +306,8 @@ impl Default for Settings {
             snooze_until: 0,
             paste_detect: true,
             image_proto: ImageProto::Unknown,
+            cell_w: 0,
+            cell_h: 0,
         }
     }
 }
