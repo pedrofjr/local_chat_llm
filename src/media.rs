@@ -74,7 +74,13 @@ pub fn prepare(raw: &[u8]) -> Result<Prepared> {
 
     let decoded = image::load_from_memory(raw).map_err(|e| anyhow!("unreadable picture: {e}"))?;
     let resized = if w > MAX_DIM || h > MAX_DIM {
-        decoded.thumbnail(MAX_DIM, MAX_DIM)
+        // `thumbnail` is the fast one, and it earns that by throwing pixel
+        // rows away before it filters. On a photo nobody notices; on a
+        // screenshot of a terminal -- which is most of what gets sent here --
+        // it is the difference between readable text and mush. This is the
+        // only lossy step on the sending side, so it is the one place worth
+        // paying for a real filter.
+        decoded.resize(MAX_DIM, MAX_DIM, image::imageops::FilterType::Lanczos3)
     } else {
         decoded
     };

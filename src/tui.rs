@@ -4,6 +4,7 @@ use crate::room::OpenRoom;
 use crate::store::{now_ts, DataDir, ImageKind, ImageProto, Notify, Record, Settings};
 use ratatui_image::picker::{Picker, ProtocolType};
 use ratatui_image::sliced::{SignedPosition, SlicedImage, SlicedProtocol};
+use ratatui_image::FilterType;
 use anyhow::Result;
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
@@ -307,8 +308,19 @@ pub struct App {
     /// into a feed slot is unreadable, and reading it is usually the point of
     /// having sent it.
     zoom: Option<Zoom>,
+    /// Set when a picture stops being drawn, and consumed by the next frame.
+    ///
+    /// Sixel is not text: the terminal keeps those pixels on its own layer,
+    /// and drawing ordinary characters where they were does not take them
+    /// away. Ratatui redraws only cells whose *contents* changed, so from its
+    /// side there is nothing to do -- and the picture stays on screen over a
+    /// conversation that has already moved on. It reads as a key that did
+    /// nothing, which is why closing one felt like a fight.
+    wipe_pixels: bool,
     /// Set by a click on the picture line, consumed by the event loop.
     pending_expand: Option<usize>,
+    /// Set by a click on the pixels themselves, consumed by the event loop.
+    pending_zoom: Option<usize>,
     /// Who the next message goes to privately. Set by `/w` and held until
     /// Esc, because the alternative -- retyping `/w` every line -- is how a
     /// private sentence ends up in the room.
@@ -366,6 +378,13 @@ struct Zoom {
     /// Kept so the picture can be re-encoded when the window is resized.
     img: Box<ImageRef>,
     shot: Shot,
+    /// The window area this was encoded against, as cells.
+    ///
+    /// Not `shot.for_area`: that is the size of the *picture*, which keeps its
+    /// proportions and so almost never equals the window. Comparing the two is
+    /// a test that can never pass -- it re-encoded every frame forever, which
+    /// on a gif meant every frame of the animation, every pass of the loop.
+    built_for: (u16, u16),
 }
 
 /// Advances every visible animation whose frame is due.
@@ -484,7 +503,9 @@ impl App {
             shots: HashMap::new(),
             proto,
             zoom: None,
+            wipe_pixels: false,
             pending_expand: None,
+            pending_zoom: None,
             on_screen: Vec::new(),
             whispering: None,
             sync_reach: (0, 0),
@@ -590,6 +611,14 @@ impl App {
         let line = row.checked_sub(self.chat_area.y)? as usize + self.scroll as usize;
         if layout.toggles.iter().any(|(at, _)| *at == line) {
             return Some(Action::Expand);
+        }
+        // Inside the pixels of an open picture.
+        if layout
+            .images
+            .iter()
+            .any(|slot| line >= slot.first_line && line < slot.first_line + slot.rows as usize)
+        {
+            return Some(Action::Zoom);
         }
         let anchor = layout.actions.as_ref()?;
         if line != anchor.line {
@@ -932,6 +961,11 @@ async fn run_inner(terminal: &mut Term) -> Result<()> {
         // Pixels do not reflow: a window resized under a zoomed picture needs
         // it encoded again, at the size it is now.
         refit_zoom(&mut app).await;
+        // Graphics live on a layer of the terminal's own that redrawing text
+        // does not touch, so taking a picture down has to be said out loud.
+        if std::mem::take(&mut app.wipe_pixels) {
+            terminal.clear()?;
+        }
         terminal.draw(|f| draw(f, &mut app))?;
         // Asked *after* drawing: the draw is what establishes which pictures
         // are actually on screen, and asking before it would miss the frame
@@ -961,6 +995,9 @@ async fn run_inner(terminal: &mut Term) -> Result<()> {
                         }
                         if let Some(idx) = app.pending_expand.take() {
                             toggle_expanded(&mut app, idx).await;
+                        }
+                        if let Some(idx) = app.pending_zoom.take() {
+                            open_zoom(&mut app, idx).await;
                         }
                     }
                     _ => {}
@@ -1313,6 +1350,10 @@ enum Action {
     /// picture's own line is more obvious than hunting for a fourth icon in
     /// the hover ruler.
     Expand,
+    /// Clicking the picture itself. Once it is open, the pixels are the
+    /// biggest target on screen and pointing at them plainly means "bigger" --
+    /// the alternative was finding the one text line above them again.
+    Zoom,
 }
 
 const HIDDEN_FILE: &str = "hidden.bin";
@@ -1398,6 +1439,7 @@ async fn open_zoom(app: &mut App, idx: usize) {
                 key,
                 img: Box::new(img),
                 shot,
+                built_for: (area.width, area.height),
             });
         }
         Err(why) => app.status = why,
@@ -1409,6 +1451,7 @@ async fn open_zoom(app: &mut App, idx: usize) {
 fn close_zoom(app: &mut App) -> bool {
     let had = app.zoom.take().is_some();
     if had {
+        app.wipe_pixels = true;
         app.status = "picture closed".into();
     }
     had
@@ -1418,23 +1461,26 @@ fn close_zoom(app: &mut App) -> bool {
 /// were encoded for the old area, and pixels do not reflow the way text does.
 async fn refit_zoom(app: &mut App) {
     let Some(zoom) = &app.zoom else { return };
-    let area = app.chat_area;
-    if zoom.shot.for_area == ratatui::layout::Size::new(area.width, area.height) {
+    let area = (app.chat_area.width, app.chat_area.height);
+    // Against the window it was built for, not against the size it came out.
+    if zoom.built_for == area {
         return;
     }
     let (key, img) = (zoom.key, (*zoom.img).clone());
-    match build_shot_within(app, &img, area.width, area.height).await {
+    match build_shot_within(app, &img, area.0, area.1).await {
         Ok(shot) => {
             app.zoom = Some(Zoom {
                 key,
                 img: Box::new(img),
                 shot,
+                built_for: area,
             });
         }
         // A window too small to hold it at all is a closed picture, not a
         // stale one drawn at the wrong size over the conversation.
         Err(why) => {
             app.zoom = None;
+            app.wipe_pixels = true;
             app.status = why;
         }
     }
@@ -1532,7 +1578,13 @@ async fn build_shot_within(
             &picker,
             frame.image,
             area,
-            ratatui_image::Resize::Fit(None),
+            // The crate defaults to `Nearest`, which is the fastest filter and
+            // the worst one: shrinking a screenshot of text with it drops
+            // whole pixel rows, so thin glyphs break up into noise. Lanczos3
+            // costs 19 ms more on a 1365x767 picture -- measured -- against an
+            // encode that already takes ~90 ms, and it is the difference
+            // between reading the screenshot and squinting at it.
+            ratatui_image::Resize::Fit(Some(FilterType::Lanczos3)),
         )
         .map_err(|e| format!("cannot draw that picture: {e}"))?;
         encoded.push(proto);
@@ -1656,6 +1708,8 @@ fn handle_mouse(app: &mut App, ev: crossterm::event::MouseEvent) {
                 // Same reason as Hide: opening reads a blob and decodes it,
                 // which the mouse handler has no way to await.
                 Some(Action::Expand) => app.pending_expand = Some(idx),
+                // Same reason again: encoding at the new size reads the blob.
+                Some(Action::Zoom) => app.pending_zoom = Some(idx),
                 None => app.picked = Some(idx),
             }
         }
@@ -2619,6 +2673,13 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
     let title = match &app.screen {
         Screen::Home => format!("  local-llm  {version}{inst}"),
         Screen::Unlock { alias, .. } => format!("  local-llm  {alias}  locked{inst}"),
+        // The way out has to be written somewhere that cannot be overwritten.
+        // The status bar is the natural home for it and the wrong one: the
+        // next network event replaces it within seconds, and then the only
+        // thing on screen is a picture with no visible exit.
+        Screen::Chat if app.zoom.is_some() && !app.masked => {
+            format!("  local-llm  {}  esc closes the picture{inst}", app.alias)
+        }
         Screen::Chat if app.masked => format!(
             "  local-llm  {}  ctx {}/4  8192 tok{inst}",
             app.alias,
@@ -4128,6 +4189,7 @@ mod tests {
             key: ([1u8; 32], 1),
             img: Box::new(a_picture([0x5a; 32])),
             shot: animated_shot(3),
+            built_for: (80, 24),
         });
 
         toggle_mask(&mut h.app);
@@ -4160,6 +4222,7 @@ mod tests {
             key: ([1u8; 32], 1),
             img: Box::new(a_picture([0x5a; 32])),
             shot: animated_shot(2),
+            built_for: (80, 24),
         });
 
         h.press(KeyCode::Esc).await;
@@ -4183,6 +4246,7 @@ mod tests {
             key: ([1u8; 32], 1),
             img: Box::new(a_picture([0x5a; 32])),
             shot: animated_shot(3),
+            built_for: (80, 24),
         });
 
         assert!(
@@ -4217,6 +4281,75 @@ mod tests {
         assert!(
             already_open(&h.app, idx),
             "an expanded picture is what the second press acts on"
+        );
+    }
+
+    /// The zoomed picture must be encoded once and left alone until the window
+    /// actually changes size.
+    ///
+    /// It was not: the check compared the size of the *picture*, which keeps
+    /// its proportions, against the size of the *window*. Those are equal
+    /// essentially never, so every pass of the main loop re-encoded -- and on
+    /// a gif, that is every frame of the animation, at around 90 ms each. The
+    /// app stopped answering the keyboard and the only way out was killing it.
+    #[tokio::test]
+    async fn a_zoomed_picture_is_not_re_encoded_on_every_pass() {
+        let mut h = Harness::new();
+        h.cmd("/new sala").await;
+        h.painted();
+
+        let area = h.app.chat_area;
+        // A shot whose own size differs from the window's, which is the normal
+        // case and was exactly the case that never settled.
+        let mut shot = animated_shot(1);
+        shot.for_area = ratatui::layout::Size::new(area.width / 2, area.height / 3);
+        h.app.zoom = Some(Zoom {
+            key: ([1u8; 32], 1),
+            img: Box::new(a_picture([0x5a; 32])),
+            shot,
+            built_for: (area.width, area.height),
+        });
+        let encoded = h.app.zoom.as_ref().unwrap().shot.frames.len();
+
+        // Several passes with nothing resized: the picture must survive
+        // untouched. A rebuild here fails to find the blob and closes it,
+        // which is precisely how the old code would show up.
+        for pass in 0..3 {
+            refit_zoom(&mut h.app).await;
+            assert!(
+                h.app.zoom.is_some(),
+                "pass {pass}: a settled picture must not be rebuilt"
+            );
+            assert_eq!(h.app.zoom.as_ref().unwrap().shot.frames.len(), encoded);
+        }
+
+        // A real resize does have to be noticed.
+        h.app.chat_area.width = area.width - 4;
+        refit_zoom(&mut h.app).await;
+        assert!(
+            h.app.zoom.is_none(),
+            "a resize must reach the rebuild -- which here has no blob to read"
+        );
+    }
+
+    /// Taking a picture down has to wipe the terminal's graphics layer, or the
+    /// pixels stay over a conversation that already moved on.
+    #[tokio::test]
+    async fn closing_a_picture_asks_for_the_pixels_to_be_wiped() {
+        let mut h = Harness::new();
+        h.cmd("/new sala").await;
+        h.app.zoom = Some(Zoom {
+            key: ([1u8; 32], 1),
+            img: Box::new(a_picture([0x5a; 32])),
+            shot: animated_shot(1),
+            built_for: (80, 24),
+        });
+        h.app.wipe_pixels = false;
+
+        assert!(close_zoom(&mut h.app));
+        assert!(
+            h.app.wipe_pixels,
+            "closing has to ask for the graphics layer to be cleared"
         );
     }
 
@@ -5799,6 +5932,48 @@ mod tests {
                     if drawn.is_ok() { "ok" } else { "FAILED" }
                 );
             }
+        }
+    }
+
+    /// What the resampling filter costs, since the default is the cheapest and
+    /// worst one there is.
+    ///
+    ///   $env:LOCAL_LLM_SHOT = 'C:\path\to\a.png'
+    ///   cargo test --release resampling_filters_cost -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn resampling_filters_cost() {
+        let Ok(path) = std::env::var("LOCAL_LLM_SHOT") else {
+            eprintln!("set LOCAL_LLM_SHOT to a picture");
+            return;
+        };
+        let raw = std::fs::read(&path).expect("read the picture");
+        let ready = crate::media::prepare(&raw).expect("prepare");
+        let frames = crate::media::frames(&ready.bytes, ready.kind, 1).expect("decode");
+        let picker = picker_for(ImageProto::Sixel, (10, 20));
+        // A window a bit smaller than the picture, which is when the filter
+        // gets to matter at all.
+        let area = ratatui::layout::Size::new(100, 28);
+        eprintln!("{}x{} into {area:?} cells", ready.w, ready.h);
+
+        for (name, filter) in [
+            ("Nearest (today)", FilterType::Nearest),
+            ("Triangle", FilterType::Triangle),
+            ("CatmullRom", FilterType::CatmullRom),
+            ("Lanczos3", FilterType::Lanczos3),
+        ] {
+            let t = Instant::now();
+            let drawn = SlicedProtocol::new_with_resize(
+                &picker,
+                frames[0].image.clone(),
+                area,
+                ratatui_image::Resize::Fit(Some(filter)),
+            );
+            eprintln!(
+                "  {name:<16} {:>7.1} ms  {}",
+                t.elapsed().as_secs_f64() * 1000.0,
+                if drawn.is_ok() { "ok" } else { "FAILED" }
+            );
         }
     }
 }

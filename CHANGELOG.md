@@ -12,6 +12,43 @@ Para atualizar, `/update` dentro do app ou `local-llm update` no terminal.
 
 ---
 
+## 0.7.2 — 21/08/2026
+
+A tela cheia da 0.7.0 tinha um defeito grave e a qualidade continuava ruim por
+um motivo que não era o que parecia.
+
+**Corrigido — a tela cheia prendia o app**
+
+- Abrir uma imagem em tela cheia **reencodava a imagem inteira a cada quadro
+  do loop**, para sempre. A verificação de "já está no tamanho certo"
+  comparava o tamanho da *imagem* — que mantém a proporção — com o tamanho da
+  *janela*. Os dois praticamente nunca são iguais, então a conta nunca fechava.
+  Com um GIF isso significa reencodar todos os quadros, a uns 90 ms cada: o
+  app parava de responder ao teclado e matar era a única saída.
+- Fechar uma imagem agora limpa a camada de gráficos do terminal. Sixel não é
+  texto — o terminal guarda esses pixels à parte, e escrever caracteres por
+  cima não os apaga. A imagem ficava sobre uma conversa que já tinha seguido
+  em frente, o que parece uma tecla que não funcionou.
+- O cabeçalho passa a dizer **`esc closes the picture`** enquanto a imagem
+  está aberta. Isso estava só na barra de status, que o próximo evento de rede
+  substitui em segundos — e aí sobra uma imagem sem saída visível.
+
+**Qualidade**
+
+- A causa era o filtro de reamostragem. O padrão da biblioteca é `Nearest`,
+  que é o mais rápido e o pior: ao reduzir, ele joga fora linhas inteiras de
+  pixels, e letra fina de print vira ruído. Agora é Lanczos3, nos dois pontos
+  onde a imagem é redimensionada — ao desenhar e, para prints acima de 1920px,
+  ao preparar para envio. Custa **19 ms a mais** num print de 1365×767, contra
+  um encode que já leva uns 90.
+- Comprimir mais antes de enviar não ajudaria: o arquivo já vai sem perda. O
+  estrago acontecia no redimensionamento, não no formato.
+
+**Novo**
+
+- Clicar **na imagem aberta** amplia para tela cheia. Antes só a linha
+  `image (+)` respondia ao clique.
+
 ## 0.7.1 — 21/08/2026
 
 **Corrigido**
