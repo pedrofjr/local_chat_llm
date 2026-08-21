@@ -12,6 +12,22 @@ Para atualizar, `/update` dentro do app ou `local-llm update` no terminal.
 
 ---
 
+## 0.7.5 — 21/08/2026
+
+**`/img proto` agora diz qual é o problema**
+
+Quando está em meio-bloco, ele passa a distinguir os dois casos, que pedem
+respostas opostas:
+
+- **No Windows Terminal:** sugere `/img proto sixel` (precisa da 1.22+).
+- **No console antigo:** avisa que ali não há como desenhar pixels, e que a
+  saída é abrir o local-llm pelo Windows Terminal.
+
+A distinção que quase todo mundo inverte: quem decide é o **terminal**, não o
+shell. `cmd` dentro do Windows Terminal desenha pixels muito bem; `powershell`
+na janela preta antiga não desenha de jeito nenhum. Trocar de shell não muda
+nada — trocar de terminal muda tudo.
+
 ## 0.7.4 — 21/08/2026
 
 **Corrigido — imagem irreconhecível em terminal sem sixel**

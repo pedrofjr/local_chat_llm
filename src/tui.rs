@@ -2250,19 +2250,29 @@ async fn image_cmd(app: &mut App, line: &str) {
             "" => {
                 let (w, h) = app.settings.cell();
                 app.notice(format!(
-                    "drawing pictures as {} — this terminal reports a {w}x{h} px character{}",
+                    "drawing pictures as {} — a character here is {w}x{h} px",
                     match app.proto {
                         ImageProto::Sixel => "sixels",
                         ImageProto::Halfblocks => "half-blocks",
                         ImageProto::Unknown => "nothing yet",
-                    },
-                    if app.proto == ImageProto::Halfblocks {
-                        ". /img proto sixel forces real pixels, which needs \
-                         Windows Terminal 1.22 or newer"
-                    } else {
-                        ""
                     }
                 ));
+                if app.proto == ImageProto::Halfblocks {
+                    // Which *terminal* is running, not which shell. This is
+                    // the thing everybody gets backwards: cmd inside Windows
+                    // Terminal draws pixels perfectly well, and powershell in
+                    // the old console cannot. Windows Terminal is the only
+                    // one that sets this.
+                    app.notice(if std::env::var_os("WT_SESSION").is_some() {
+                        "this is Windows Terminal — try /img proto sixel (needs 1.22 or newer)"
+                            .to_string()
+                    } else {
+                        "this is the old console, which cannot draw pixels at all. \
+                         open local-llm from Windows Terminal instead — cmd or powershell \
+                         inside it, either one works"
+                            .to_string()
+                    });
+                }
                 return;
             }
             other => {
