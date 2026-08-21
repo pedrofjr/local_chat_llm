@@ -12,6 +12,32 @@ Para atualizar, `/update` dentro do app ou `local-llm update` no terminal.
 
 ---
 
+## 0.8.0 — 21/08/2026
+
+**Novo — menção com `@`**
+
+Escrever `@Fulano` no meio de uma frase agora **pinta o nome na cor dele**, a
+mesma que já aparece no cabeçalho das mensagens. `Tab` completa enquanto você
+digita, inclusive nomes com espaço, sem aspas.
+
+Quando o mencionado é **você**, o nome sai invertido — é o que se enxerga de
+relance numa tela cheia de texto.
+
+Isso fecha uma metade que faltava: dava para pedir `/notify mention` e ser
+avisado quando citassem seu nome, mas não havia como citar ninguém de
+propósito. O aviso não mudou — continua casando por palavra inteira, com ou
+sem `@`, para "ana" não disparar dentro de "banana".
+
+Cuidados que valem dizer:
+
+- `@` na frente de qualquer outra coisa continua texto comum. Um e-mail não
+  vira menção.
+- Um `@` que não nomeia ninguém não engole a menção seguinte na mesma linha.
+- Entre dois nomes onde um é começo do outro, vence o mais longo: `@Anabela`
+  não é a Ana.
+- Sob `F12` nada é pintado. O texto já aparece como está ali, e destacar um
+  nome em cor seria justamente a coisa mais parecida com uma conversa na tela.
+
 ## 0.7.5 — 21/08/2026
 
 **`/img proto` agora diz qual é o problema**

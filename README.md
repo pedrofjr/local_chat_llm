@@ -92,6 +92,17 @@ respondem ou copiam. A resposta aparece citada:
 Cada pessoa recebe uma **cor própria**, derivada do identificador dela — todo
 mundo vê a mesma pessoa na mesma cor, sem ninguém configurar nada.
 
+Escrever `@Fulano` no meio de uma frase pinta o nome na cor dele, e `Tab`
+completa enquanto você digita — inclusive nomes com espaço, sem aspas. Quando
+o mencionado é **você**, o nome sai invertido, que é o que se enxerga de longe.
+`@` na frente de qualquer outra coisa continua texto comum: um e-mail não vira
+menção.
+
+Isso é o par que faltava do `/notify mention` — antes dava para pedir aviso só
+quando citassem seu nome, mas não havia como citar ninguém de propósito. O
+aviso continua casando por palavra inteira, com ou sem `@`, para "ana" não
+disparar dentro de "banana".
+
 `/w <nome>` aponta o prompt para alguém, e ele **fica apontado**: o `> ` vira
 `Fulano →` em âmbar, com a borda mudando de cor junto. As próximas linhas vão
 para ele até você apertar `Esc`. Isso não é conforto — é o conserto do acidente

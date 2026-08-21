@@ -1676,6 +1676,25 @@ fn copy_message(app: &mut App, idx: usize) {
 /// rather than an exact spelling.
 fn complete_nick(app: &mut App) {
     let text = app.input.text.clone();
+    // An `@` being typed anywhere in the line completes to a name. Without
+    // this, mentioning somebody means spelling them exactly right, and a
+    // near miss is invisible: it just quietly fails to notify them.
+    if let Some(mark) = text.rfind('@') {
+        let partial = text[mark + 1..].to_lowercase();
+        // Only while still typing the name -- an `@` earlier in a finished
+        // sentence is not what Tab is being asked about.
+        if !partial.contains(' ') || app.names.values().any(|n| n.contains(' ')) {
+            let hit = app
+                .names
+                .values()
+                .find(|name| name.to_lowercase().starts_with(&partial));
+            if let Some(name) = hit {
+                app.input.text = format!("{}@{name} ", &text[..mark]);
+                app.input.cursor = app.input.len();
+                return;
+            }
+        }
+    }
     // Everything after the command is the candidate, so a name with spaces in
     // it can still be completed.
     let Some((cmd, partial)) = text.split_once(' ') else {
@@ -2858,7 +2877,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         ("ctrl+end", "jump to the newest"),
         ("up / down", "reuse what you typed"),
         ("shift+enter", "newline"),
-        ("tab", "complete a name"),
+        ("tab", "complete a name, or @name"),
         ("del", "on the list: delete"),
         ("esc", "clear the line"),
     ];
@@ -3086,6 +3105,80 @@ fn draw_zoom(f: &mut Frame, area: Rect, app: &mut App) {
 
 /// True when `nick` appears in `text` as a whole word, with or without a
 /// leading @. Substring matching would make "ana" fire on "banana".
+/// Splits a line of message text so that `@name` stands out in that person's
+/// own colour, leaving everything else in the body style.
+///
+/// The names come from the room, so `@` in front of anything else -- an email,
+/// a handle from somewhere -- is left as ordinary text. Matching is the same
+/// rule the whisper command uses: the longest known nick that fits, so
+/// "Grok 4.5" works without quotes and "Ana" does not match inside "Anabela".
+///
+/// Under the disguise this does nothing at all. The body is already shown
+/// as-is there, so a name typed into a message is visible either way -- but
+/// painting it would draw the eye to the one thing that reads as a chat.
+fn mention_spans(
+    line: &str,
+    names: &HashMap<[u8; 32], String>,
+    me: &[u8; 32],
+    masked: bool,
+    body: Style,
+) -> Vec<Span<'static>> {
+    if masked || !line.contains('@') {
+        return vec![Span::styled(line.to_string(), body)];
+    }
+    // Longest first, so "Ana Paula" wins over "Ana" when both are in the room.
+    let mut known: Vec<(&[u8; 32], &String)> = names.iter().collect();
+    known.sort_by_key(|(_, name)| std::cmp::Reverse(name.chars().count()));
+
+    let lower = line.to_lowercase();
+    let mut spans = Vec::new();
+    let mut plain_from = 0usize;
+    let mut at = 0usize;
+    while let Some(found) = line[at..].find('@') {
+        let mark = at + found;
+        let after = mark + 1;
+        let hit = known.iter().find(|(_, name)| {
+            let name = name.to_lowercase();
+            !name.is_empty()
+                && lower[after..].starts_with(&name)
+                && lower[after + name.len()..]
+                    .chars()
+                    .next()
+                    .is_none_or(|c| !c.is_alphanumeric())
+        });
+        match hit {
+            Some((id, name)) => {
+                let end = after + name.len();
+                if plain_from < mark {
+                    spans.push(Span::styled(line[plain_from..mark].to_string(), body));
+                }
+                let (r, g, b) = color_for(id);
+                // Being named yourself is the one worth catching across a
+                // room, so it gets weight on top of the colour.
+                let mut style = Style::default()
+                    .fg(Color::Rgb(r, g, b))
+                    .add_modifier(Modifier::BOLD);
+                if *id == me {
+                    style = style.add_modifier(Modifier::REVERSED);
+                }
+                spans.push(Span::styled(line[mark..end].to_string(), style));
+                plain_from = end;
+                at = end;
+            }
+            // An `@` that names nobody here. Step past it rather than past the
+            // whole rest, or a later real mention on the same line is missed.
+            None => at = after,
+        }
+    }
+    if plain_from < line.len() {
+        spans.push(Span::styled(line[plain_from..].to_string(), body));
+    }
+    if spans.is_empty() {
+        spans.push(Span::styled(String::new(), body));
+    }
+    spans
+}
+
 fn mentions(text: &str, nick: &str) -> bool {
     if nick.is_empty() {
         return false;
@@ -3719,10 +3812,15 @@ fn build_lines(app: &App, width: u16) -> Transcript {
                     sink.push(Line::from(head), Some(idx));
                     for piece in wrap_text(&shown, bubble) {
                         let pad = indent(edge, piece.chars().count());
-                        sink.push(
-                            Line::from(Span::styled(pad + &piece, body_style)),
-                            Some(idx),
-                        );
+                        let mut spans = vec![Span::styled(pad, body_style)];
+                        spans.extend(mention_spans(
+                            &piece,
+                            &app.names,
+                            &app.me,
+                            app.masked || hidden_here,
+                            body_style,
+                        ));
+                        sink.push(Line::from(spans), Some(idx));
                     }
                     if let Some(img) = image {
                         match frame_image(app, img, (*author, *seq)) {
@@ -3779,10 +3877,15 @@ fn build_lines(app: &App, width: u16) -> Transcript {
                     }
                     sink.push(Line::from(head), Some(idx));
                     for piece in wrap_text(&shown, if app.masked { inner } else { bubble }) {
-                        sink.push(
-                            Line::from(Span::styled(format!("  {piece}"), body_style)),
-                            Some(idx),
-                        );
+                        let mut spans = vec![Span::styled("  ".to_string(), body_style)];
+                        spans.extend(mention_spans(
+                            &piece,
+                            &app.names,
+                            &app.me,
+                            app.masked || hidden_here,
+                            body_style,
+                        ));
+                        sink.push(Line::from(spans), Some(idx));
                     }
                     if let Some(img) = image {
                         match frame_image(app, img, (*author, *seq)) {
@@ -4466,6 +4569,86 @@ mod tests {
             Some(key.as_str()),
             "the key should reach the clipboard stand-in, and only the stand-in"
         );
+    }
+
+    /// `@name` should be painted in that person's colour, and only when it is
+    /// really one of them.
+    #[test]
+    fn a_mention_is_painted_only_when_it_names_somebody_here() {
+        let (ana, dale, me) = ([1u8; 32], [2u8; 32], [3u8; 32]);
+        let mut names = HashMap::new();
+        names.insert(ana, "Ana".to_string());
+        names.insert(dale, "Dale".to_string());
+        names.insert(me, "Grok 4.5".to_string());
+        let body = Style::default();
+
+        let painted = |line: &str| -> Vec<(String, bool)> {
+            mention_spans(line, &names, &me, false, body)
+                .into_iter()
+                .map(|s| (s.content.to_string(), s.style != body))
+                .collect()
+        };
+
+        // The plain case: one name, lit up, the rest untouched.
+        let spans = painted("bom dia @Ana tudo certo?");
+        assert_eq!(
+            spans,
+            vec![
+                ("bom dia ".to_string(), false),
+                ("@Ana".to_string(), true),
+                (" tudo certo?".to_string(), false),
+            ]
+        );
+
+        // An address is not a mention: nobody here is called "empresa.com".
+        let spans = painted("manda pra fulano@empresa.com");
+        assert!(
+            spans.iter().all(|(_, lit)| !lit),
+            "an email must stay ordinary text: {spans:?}"
+        );
+
+        // An unknown handle must not eat the real mention after it.
+        let spans = painted("@ninguem e @Dale");
+        assert!(
+            spans.iter().any(|(text, lit)| text == "@Dale" && *lit),
+            "a later mention still has to be found: {spans:?}"
+        );
+
+        // Names with spaces work without quotes, same as the whisper command.
+        let spans = painted("@Grok 4.5 responde");
+        assert!(
+            spans.iter().any(|(text, lit)| text == "@Grok 4.5" && *lit),
+            "a name with a space in it should match whole: {spans:?}"
+        );
+
+        // Prefix of a longer name must not match on its own.
+        let mut longer = names.clone();
+        longer.insert([9u8; 32], "Anabela".to_string());
+        let spans: Vec<String> = mention_spans("oi @Anabela", &longer, &me, false, body)
+            .into_iter()
+            .filter(|s| s.style != body)
+            .map(|s| s.content.to_string())
+            .collect();
+        assert_eq!(
+            spans,
+            vec!["@Anabela".to_string()],
+            "the longest name that fits should win"
+        );
+    }
+
+    /// The disguise exists to make the screen stop reading as a conversation.
+    /// A name lit up in somebody's colour is the most conversation-looking
+    /// thing on it.
+    #[test]
+    fn the_disguise_leaves_mentions_unpainted() {
+        let ana = [1u8; 32];
+        let mut names = HashMap::new();
+        names.insert(ana, "Ana".to_string());
+        let body = Style::default();
+
+        let spans = mention_spans("oi @Ana", &names, &[3u8; 32], true, body);
+        assert_eq!(spans.len(), 1, "masked text must stay one plain run");
+        assert_eq!(spans[0].style, body);
     }
 
     fn a_picture(blob: [u8; 32]) -> ImageRef {
