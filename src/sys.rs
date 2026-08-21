@@ -598,7 +598,60 @@ mod imp {
     }
 }
 
-pub use imp::{copy, grab_image, has_image, protect, unprotect};
+pub use imp::{grab_image, has_image, protect, unprotect};
+
+/// Puts text on the system clipboard.
+///
+/// Under `cargo test` it deliberately does not. The suite opens rooms by the
+/// dozen, and `/new` copies the room key -- so running the tests filled the
+/// developer's Windows clipboard history with real room PINs. Sitting in
+/// Win+V they outlive the test run, survive a reboot, and go to Microsoft
+/// outright if Clipboard Sync is on. A test that leaks a secret onto the
+/// machine running it is a broken test, however green it reports.
+///
+/// The recorded text stays readable through `copied()`, so tests can still
+/// check *what* would have been copied.
+#[cfg(not(test))]
+pub fn copy(text: &str) -> bool {
+    imp::copy(text)
+}
+
+#[cfg(test)]
+pub fn copy(text: &str) -> bool {
+    // Named but never called, so the real one is still compiled and
+    // type-checked by `cargo test` instead of quietly rotting behind a cfg.
+    let _ = imp::copy as fn(&str) -> bool;
+    test_clipboard::put(text);
+    true
+}
+
+/// Stands in for the clipboard during tests.
+#[cfg(test)]
+mod test_clipboard {
+    use std::sync::Mutex;
+    use std::sync::OnceLock;
+
+    fn slot() -> &'static Mutex<Option<String>> {
+        static SLOT: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+        SLOT.get_or_init(|| Mutex::new(None))
+    }
+
+    pub fn put(text: &str) {
+        if let Ok(mut held) = slot().lock() {
+            *held = Some(text.to_string());
+        }
+    }
+
+    pub fn get() -> Option<String> {
+        slot().lock().ok().and_then(|held| held.clone())
+    }
+}
+
+/// What the last `copy` would have put on the clipboard.
+#[cfg(test)]
+pub fn copied() -> Option<String> {
+    test_clipboard::get()
+}
 
 #[cfg(all(test, windows))]
 mod tests {

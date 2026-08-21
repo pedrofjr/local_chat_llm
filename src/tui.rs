@@ -4425,6 +4425,39 @@ mod tests {
         );
     }
 
+    /// Creating a room copies its key, and the suite creates rooms by the
+    /// dozen. Those copies were landing on the real Windows clipboard, so a
+    /// test run left a pile of working room PINs in the developer's Win+V
+    /// history -- outliving the run, surviving a reboot, and going to
+    /// Microsoft outright with Clipboard Sync on.
+    ///
+    /// The copy still has to happen, and still has to carry the key; it just
+    /// must not reach the machine.
+    #[tokio::test]
+    async fn creating_a_room_never_puts_its_key_on_the_real_clipboard() {
+        let mut h = Harness::new();
+        h.cmd("/new sala").await;
+
+        let key = h
+            .app
+            .room
+            .as_ref()
+            .expect("a room")
+            .lock()
+            .await
+            .pin
+            .display();
+        // This one assertion carries both halves. It only passes if the copy
+        // happened *and* the stand-in is what took it: were `sys::copy` to go
+        // back to the system clipboard, nothing would be recorded here and
+        // this reads `None`.
+        assert_eq!(
+            crate::sys::copied().as_deref(),
+            Some(key.as_str()),
+            "the key should reach the clipboard stand-in, and only the stand-in"
+        );
+    }
+
     fn a_picture(blob: [u8; 32]) -> ImageRef {
         ImageRef {
             blob,
