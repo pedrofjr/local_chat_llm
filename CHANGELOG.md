@@ -12,6 +12,42 @@ Para atualizar, `/update` dentro do app ou `local-llm update` no terminal.
 
 ---
 
+## 0.7.4 — 21/08/2026
+
+**Corrigido — imagem irreconhecível em terminal sem sixel**
+
+A mesma imagem saía nítida numa máquina e em blocos gigantes na outra. Quem
+tem sixel vê pixels de verdade; quem não tem cai em meio-bloco — e o
+meio-bloco estava sendo desperdiçado.
+
+Meio-bloco desenha **um pixel por meia célula**: a resolução final é
+literalmente o número de células. Só que o layout usava o tamanho real do
+caractere do terminal (10×20 px), que é a conta certa para sixel e a errada
+aqui — a imagem era pedida num tamanho em que jamais seria desenhada. Um print
+de 580×419 virava **58×40 pixels**.
+
+Agora a conta usa a célula que o meio-bloco realmente tem, 1×2 px: o mesmo
+print sai em 71×52 no feed e 77×56 em tela cheia — **1,6× a 1,9× mais pixels**.
+
+Dito isso, sem enrolação: **meio-bloco nunca vai ficar bom**. Contra os
+243.000 pixels que o sixel entrega, mesmo o dobro de quase nada continua sendo
+pouco. Se a sua imagem está em blocos, o caminho é o sixel — veja abaixo.
+
+**Novo — `/img proto` agora responde em vez de resetar**
+
+Digitar `/img proto` sem argumento mostra o que está em uso e o tamanho de
+caractere que o terminal informou. Antes ele **zerava** a detecção em silêncio,
+que é a pior resposta possível a uma pergunta: mudava a coisa perguntada.
+
+Se disser meio-bloco:
+
+- `/img proto sixel` força pixels de verdade. Se a imagem aparecer certa,
+  pronto. Se aparecer lixo, o terminal não suporta.
+- Sixel precisa de **Windows Terminal 1.22 ou mais novo**. Console antigo
+  (`conhost`) não tem.
+- `/img proto auto` e reabrir o app refaz a detecção, para o caso de ela ter
+  falhado uma vez e ficado gravada.
+
 ## 0.7.3 — 21/08/2026
 
 **Corrigido — depois do `/update`, o teclado ia para o PowerShell**

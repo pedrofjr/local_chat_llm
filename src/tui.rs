@@ -852,6 +852,26 @@ fn settle_image_proto() {
 /// `cell` is what the terminal said one character occupies. Sixel puts real
 /// pixels inside an area measured in cells, so this number is the conversion
 /// between the two and getting it wrong scales the whole picture.
+/// The cell size that matters for laying a picture out, which is not always
+/// the one the terminal reported.
+///
+/// Sixel paints real pixels into the character grid, so there the terminal's
+/// own cell is the conversion and nothing else will do.
+///
+/// Half-blocks are different in a way that is easy to get backwards. One cell
+/// carries exactly two pixels, top and bottom -- the encoder literally resizes
+/// to `columns x (rows * 2)` -- so the resolution *is* the cell count, and the
+/// real font size has nothing to do with it. Handing it 10x20 was asking for a
+/// picture the size of a stamp and then wondering why it had no detail: a
+/// 580x419 screenshot came out 58x40. Telling it a cell is 1x2 lets the
+/// picture claim the columns it needs, and every column is a pixel earned.
+fn layout_cell(proto: ImageProto, measured: (u16, u16)) -> (u16, u16) {
+    match proto {
+        ImageProto::Sixel => measured,
+        _ => (1, 2),
+    }
+}
+
 fn picker_for(proto: ImageProto, cell: (u16, u16)) -> Picker {
     // Deprecated in favour of `from_query_stdio` or `halfblocks`, and neither
     // can do this job: the first reads stdin, which is the one thing we may
@@ -1584,7 +1604,10 @@ async fn build_shot_within(
         return Err("waiting for the pixels to arrive…".into());
     };
 
-    let cell = Cell::from(app.settings.cell());
+    // The picker and the layout must agree on what a cell is, or the encoder
+    // fills an area of a different size than the one reserved for it.
+    let effective = layout_cell(app.proto, app.settings.cell());
+    let cell = Cell::from(effective);
     let (cols, rows) = fit_cells(img.w, img.h, max_cols, max_rows, cell);
     if cols == 0 || rows == 0 {
         return Err("terminal too small for that picture".into());
@@ -1592,7 +1615,7 @@ async fn build_shot_within(
 
     let frames = crate::media::frames(&bytes, img.kind, MAX_GIF_FRAMES)
         .map_err(|e| format!("cannot read that picture: {e}"))?;
-    let picker = picker_for(app.proto, app.settings.cell());
+    let picker = picker_for(app.proto, effective);
     let area = ratatui::layout::Size::new(cols, rows);
     let mut encoded = Vec::with_capacity(frames.len());
     let mut delays = Vec::with_capacity(frames.len());
@@ -2220,7 +2243,28 @@ async fn image_cmd(app: &mut App, line: &str) {
             "sixel" => ImageProto::Sixel,
             "halfblocks" | "blocks" => ImageProto::Halfblocks,
             // Clears the stored answer; the next start asks the terminal again.
-            "auto" | "" => ImageProto::Unknown,
+            "auto" => ImageProto::Unknown,
+            // Asking with no argument means "what is it now?". It used to
+            // silently reset instead, which is the worst possible answer to a
+            // question: it changes the thing being asked about.
+            "" => {
+                let (w, h) = app.settings.cell();
+                app.notice(format!(
+                    "drawing pictures as {} — this terminal reports a {w}x{h} px character{}",
+                    match app.proto {
+                        ImageProto::Sixel => "sixels",
+                        ImageProto::Halfblocks => "half-blocks",
+                        ImageProto::Unknown => "nothing yet",
+                    },
+                    if app.proto == ImageProto::Halfblocks {
+                        ". /img proto sixel forces real pixels, which needs \
+                         Windows Terminal 1.22 or newer"
+                    } else {
+                        ""
+                    }
+                ));
+                return;
+            }
             other => {
                 app.status = format!("unknown protocol {other} — sixel, halfblocks or auto");
                 return;
@@ -4454,6 +4498,50 @@ mod tests {
         // Degenerate input must not panic or divide by zero.
         assert_eq!(fit_cells(0, 0, 40, 20, cell), (0, 0));
         assert_eq!(fit_cells(100, 100, 0, 20, cell), (0, 0));
+    }
+
+    /// Half-blocks resolve one pixel per half cell, so the cell count *is* the
+    /// resolution -- the encoder resizes to `columns x (rows * 2)`. Laying out
+    /// against the terminal's real 10x20 character therefore throws detail
+    /// away by the bucket: the picture is asked for at a size it will never be
+    /// drawn at.
+    ///
+    /// This is what the group saw. The same 580x419 screenshot was sharp on a
+    /// machine that had sixel and unreadable on one that did not.
+    #[test]
+    fn half_blocks_measure_a_cell_in_pixels_not_in_font() {
+        let (w, h) = (580, 419);
+        // Room to work with; the point is what each protocol asks for, not
+        // what the window can spare.
+        let (max_cols, max_rows) = (200, 200);
+
+        let sixel = Cell::from(layout_cell(ImageProto::Sixel, (10, 20)));
+        let blocks = Cell::from(layout_cell(ImageProto::Halfblocks, (10, 20)));
+
+        let (sixel_cols, sixel_rows) = fit_cells(w, h, max_cols, max_rows, sixel);
+        let (block_cols, block_rows) = fit_cells(w, h, max_cols, max_rows, blocks);
+
+        // Sixel: cells are big because each one holds 10x20 real pixels.
+        assert_eq!((sixel_cols, sixel_rows), (58, 20));
+
+        // Half-blocks: the drawn resolution is columns by twice the rows, and
+        // it has to beat what the old layout produced by a wide margin.
+        let old = 58 * (20 * 2);
+        let now = u32::from(block_cols) * u32::from(block_rows) * 2;
+        assert!(
+            now > old * 4,
+            "half-blocks got {block_cols}x{block_rows} cells = {now} pixels, \
+             barely better than the {old} it used to waste"
+        );
+
+        // And it still keeps the picture's shape: a cell is one pixel wide and
+        // two tall, so the drawn pixels should come out close to 580:419.
+        let drawn_ratio = f64::from(block_cols) / f64::from(u32::from(block_rows) * 2);
+        let real_ratio = f64::from(w) / f64::from(h);
+        assert!(
+            (drawn_ratio - real_ratio).abs() < 0.1,
+            "shape drifted: {drawn_ratio:.2} against {real_ratio:.2}"
+        );
     }
 
     /// A narrower cell means the same picture needs *more* columns to keep
